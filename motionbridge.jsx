@@ -35,7 +35,7 @@ function MotionBridge(thisObj) {
     var CONFIG = {
         scriptName: "MotionBridge",
         version: 0.9,
-        websiteurl: "https://www.nathanstassin.com/motionbridge",
+        websiteurl: "https://nathanstassin.com/motionbridge",
         projectIDPrefix: "MotionBridgeProjectID:",
         folderNames: {
             linkedComps: "0_LinkedComps",
