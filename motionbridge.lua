@@ -671,23 +671,29 @@ function write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeh
 
         local track_info = clip:GetTrackTypeAndIndex()
         local parLabel = clip:GetMediaPoolItem():GetClipProperty("PAR")
-        if parLabel ~= "Square" then 
-            if confirm("Legacy pixel aspect ratio detected for clip: " .. clip:GetName() .. ". Change to square (recommended)?") then 
-                clip:GetMediaPoolItem():SetClipProperty("PAR", "Square")
-                parLabel = "Square"
-            else 
-                alert("Non-square pixel aspect ratios may not translate reliably to After Effects.\n" .. "Unless this clip is intentionally anamorphic or SD archival media, square pixels are recommended.")
+        local pixelAspectRatio = "N/A"
+        local flipX = "N/A"
+        local flipY = "N/A"
+        if track_info[1] == "video" then 
+            if parLabel ~= "Square" then 
+                if confirm("Legacy pixel aspect ratio detected for clip: " .. clip:GetName() .. ". Change to square (recommended)?") then 
+                    clip:GetMediaPoolItem():SetClipProperty("PAR", "Square")
+                    parLabel = "Square"
+                else 
+                    alert("Non-square pixel aspect ratios may not translate reliably to After Effects.\n" .. "Unless this clip is intentionally anamorphic or SD archival media, square pixels are recommended.")
+                end
             end
-        end
-        
-        local pixelAspectRatio = _G.CONSTANTS.PAR_MAP[parLabel]
+            
+            pixelAspectRatio = _G.CONSTANTS.PAR_MAP[parLabel]
 
-        if not pixelAspectRatio then
-            pixelAspectRatio = tonumber(parLabel)
             if not pixelAspectRatio then
-                error("Unusable PAR value: " .. tostring(parLabel))
+                pixelAspectRatio = tonumber(parLabel)
             end
-        end
+
+            flipX = tostring(clip:GetProperty("FlipX"))
+            flipY = tostring(clip:GetProperty("FlipY"))
+        end 
+    
 
         -- Known limitation: anchorpoints behave differently, so ommiting from layerData intentionally: AE (position + rotation) | Resolve (only rotation)
         table.insert(comp_entry["layers"], {
@@ -698,14 +704,14 @@ function write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeh
             sourceStartFrame = clip:GetSourceStartFrame(),
             recordFrame = clip:GetStart(true) - record_frame_offset,
             duration = clip:GetDuration(true),
-            zoomX = clip:GetProperty("ZoomX"),
-            zoomY = clip:GetProperty("ZoomY"),
-            pan = clip:GetProperty("Pan"),
-            tilt = clip:GetProperty("Tilt"),
-            rotationAngle = clip:GetProperty("RotationAngle"),
-            flipX = tostring(clip:GetProperty("FlipX")), 
-            flipY = tostring(clip:GetProperty("FlipY")), 
-            opacity = clip:GetProperty("Opacity"),
+            zoomX = clip:GetProperty("ZoomX") or "N/A",
+            zoomY = clip:GetProperty("ZoomY") or "N/A",
+            pan = clip:GetProperty("Pan") or "N/A",
+            tilt = clip:GetProperty("Tilt") or "N/A",
+            rotationAngle = clip:GetProperty("RotationAngle") or "N/A",
+            flipX = flipX, 
+            flipY = flipY, 
+            opacity = clip:GetProperty("Opacity") or "N/A",
             pixelAspect = pixelAspectRatio
         })
     end

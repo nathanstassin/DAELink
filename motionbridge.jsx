@@ -509,7 +509,7 @@ function MotionBridge(thisObj) {
             }
 
             // Handle pixel aspect ratio (likely irrelevant in most workflows)
-            if (layerData.pixelAspect !== undefined) {
+            if (layerData.pixelAspect !== "N/A") {
                 if (layerData.pixelAspect !== 1) {
                     if (confirm("Legacy Pixel Aspect Ratio: " + layerData.pixelAspect + " deteceted for layer: " + layerData.layerName + ".\n Change to square?")) {
                         importedItem.pixelAspect = 1;
