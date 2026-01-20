@@ -61,6 +61,7 @@ _G.CONSTANTS = {
         SUPPORT = "support"
     },
     MARKER_COLORS = {'Blue', 'Cyan', 'Green', 'Yellow', 'Red', 'Pink', 'Purple', 'Fuchsia', 'Rose', 'Lavender', 'Sky', 'Mint', 'Lemon', 'Sand', 'Cocoa', 'Cream'},
+    PAR_MAP = { ["1.25"] = 1.25, ["1.33"] = 1.3333333333333333, ["1.3x Anamorphic"] = 1.2999999523162842, ["1.5"] = 1.5, ["1.8"] = 1.7999999523162842, ["16mm HD Anamorphic"] = 0.7845, ["2.0"] = 2.0, ["35mm Full Aperture HD Anamorphic"] = 0.740, ["NTSC"] = 0.9090909090909091, ["NTSC 16:9"] = 1.2121212121212122, ["NTSC DV"] = 0.9090909090909091, ["NTSC DV 16:9"] = 1.2121212121212122, ["PAL"] = 1.0909090909090908, ["PAL 16:9"] = 1.4545454545454546, ["Square"] = 1.0, ["Super16 HD Anamorphic"] = 0.9090909090909091 },
     VIDEO_EXTENSIONS = {".mov", ".mp4", ".mxf", ".avi", ".mkv", ".m4v", ".wmv", ".flv", ".webm", ".mpg", ".mpeg", ".tif", ".tiff"},
     PLACEHOLDER_DURATION = 5,  -- seconds
     FILE_DISPLAY_MAX_LENGTH = 90,
@@ -669,6 +670,25 @@ function write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeh
         end
 
         local track_info = clip:GetTrackTypeAndIndex()
+        local parLabel = clip:GetMediaPoolItem():GetClipProperty("PAR")
+        if parLabel ~= "Square" then 
+            if confirm("Legacy pixel aspect ratio detected for clip: " .. clip:GetName() .. ". Change to square (recommended)?") then 
+                clip:GetMediaPoolItem():SetClipProperty("PAR", "Square")
+                parLabel = "Square"
+            else 
+                alert("Non-square pixel aspect ratios may not translate reliably to After Effects.\n" .. "Unless this clip is intentionally anamorphic or SD archival media, square pixels are recommended.")
+            end
+        end
+        
+        local pixelAspectRatio = _G.CONSTANTS.PAR_MAP[parLabel]
+
+        if not pixelAspectRatio then
+            pixelAspectRatio = tonumber(parLabel)
+            if not pixelAspectRatio then
+                error("Unusable PAR value: " .. tostring(parLabel))
+            end
+        end
+
         -- Known limitation: anchorpoints behave differently, so ommiting from layerData intentionally: AE (position + rotation) | Resolve (only rotation)
         table.insert(comp_entry["layers"], {
             layerName = clip:GetName(),
@@ -685,7 +705,8 @@ function write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeh
             rotationAngle = clip:GetProperty("RotationAngle"),
             flipX = tostring(clip:GetProperty("FlipX")), 
             flipY = tostring(clip:GetProperty("FlipY")), 
-            opacity = clip:GetProperty("Opacity")
+            opacity = clip:GetProperty("Opacity"),
+            pixelAspect = pixelAspectRatio
         })
     end
 

@@ -507,6 +507,22 @@ function MotionBridge(thisObj) {
                     continue;
                 }
             }
+
+            // Handle pixel aspect ratio (likely irrelevant in most workflows)
+            if (layerData.pixelAspect !== undefined) {
+                if (layerData.pixelAspect !== 1) {
+                    if (confirm("Legacy Pixel Aspect Ratio: " + layerData.pixelAspect + " deteceted for layer: " + layerData.layerName + ".\n Change to square?")) {
+                        importedItem.pixelAspect = 1;
+                    } else {
+                        alert("Pixel Aspect Ratio unchanged - sizing may appear incorrect.");
+                        importedItem.pixelAspect = layerData.pixelAspect;
+                    }
+                }
+                else {
+                    importedItem.pixelAspect = layerData.pixelAspect;
+                }
+            }
+
             var currentLayer = comp.layers.add(importedItem);
             
             // Move audio layers to bottom (highest index)
