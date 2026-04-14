@@ -31,6 +31,7 @@
                 
     Version History:
     - 0.9 Beta - 17/01/2026 
+    - 0.95 Beta - 14/04/2026 - UI improvements
 ]]
 
 -- GLOBALS
@@ -45,6 +46,15 @@ _G.motionbridge_folder = nil
 _G.comps_folder = nil 
 _G.renders_folder = nil 
 _G.compound_clips_folder = nil 
+
+-- Capture the script's own directory at the top level, where debug.getinfo is reliable.
+-- Inside functions, debug.getinfo returns the call site, not the script file.
+do
+    local src = debug.getinfo(1, "S").source or ""
+    src = src:gsub("^@", ""):gsub("\\", "/")
+    local dir = src:match("^(.*)/[^/]+$")
+    _G.SCRIPT_DIR = dir or ""
+end
 
 _G.CONSTANTS = {
     MOTIONBRIDGE_VERSION = 0.9,
@@ -76,12 +86,24 @@ _G.CONSTANTS = {
         COMPOUND_CLIP = "COMPOUND CLIP"
     },
     JSON_FILENAME = "motionbridge.json",
+    SETTINGS_FILENAME = "motionbridge_projects.json",
     COMMENT_ID_PREFIX = "ID(DONOTDELETE):",
     PRELINK_PATTERN = "^prelink%d+$",
     LINKED_CLIPS_SUFFIX = " linked clips",
     CUSTOM_SETTINGS = {
         DEFAULT_WIDTH = 1920,
         DEFAULT_HEIGHT = 1080
+    },
+    RESOLUTION_PRESETS = {
+        { label = "Match Project",  width = nil,  height = nil  },
+        { label = "1920 × 1080",    width = 1920, height = 1080 },
+        { label = "3840 × 2160",    width = 3840, height = 2160 },
+        { label = "1280 × 720",     width = 1280, height = 720  },
+        { label = "1080 × 1920",    width = 1080, height = 1920 },
+        { label = "1080 × 1080",    width = 1080, height = 1080 },
+        { label = "2048 × 1080",    width = 2048, height = 1080 },
+        { label = "4096 × 2160",    width = 4096, height = 2160 },
+        { label = "Custom...",      width = nil,  height = nil  },
     },
     SEARCH_SAFETY_LIMIT = 100,  
     ICONS = {
@@ -141,7 +163,163 @@ function build_project_paths(base)
     }
 end
 
-function initialise(project_media_path)    
+-- SETTINGS PERSISTENCE (per-project path memory)
+-- Stored in motionbridge_projects.json alongside the script file.
+-- Dict format: { [davinci_project_uuid] = "/path/to/media/folder", ... }
+function get_settings_path()
+    if _G.SCRIPT_DIR and _G.SCRIPT_DIR ~= "" then
+        local path = _G.SCRIPT_DIR .. "/" .. _G.CONSTANTS.SETTINGS_FILENAME
+        print("MotionBridge: settings file → " .. path)
+        return path
+    end
+    print("MotionBridge: WARNING — could not determine script directory for settings file.")
+    return _G.CONSTANTS.SETTINGS_FILENAME
+end
+
+-- Minimal encode/decode for a flat string→string dict.
+-- Avoids dependency on the local json variable defined later in the file.
+function settings_encode(dict)
+    local parts = {}
+    for k, v in pairs(dict) do
+        local ek = tostring(k):gsub('\\', '\\\\'):gsub('"', '\\"')
+        local ev = tostring(v):gsub('\\', '\\\\'):gsub('"', '\\"')
+        table.insert(parts, '"' .. ek .. '":"' .. ev .. '"')
+    end
+    return "{" .. table.concat(parts, ",") .. "}"
+end
+
+function settings_decode(str)
+    local dict = {}
+    if not str or str:match("^%s*$") then return dict end
+    for k, v in str:gmatch('"(.-[^\\])"%s*:%s*"(.-[^\\])"') do
+        -- Unescape basic sequences
+        k = k:gsub('\\"', '"'):gsub('\\\\', '\\')
+        v = v:gsub('\\"', '"'):gsub('\\\\', '\\')
+        dict[k] = v
+    end
+    return dict
+end
+
+function load_project_settings()
+    local path = get_settings_path()
+    local f = io.open(path, "r")
+    if not f then return {} end
+    local content = f:read("*a")
+    f:close()
+    return settings_decode(content)
+end
+
+function save_project_settings(settings)
+    local path = get_settings_path()
+    local f = io.open(path, "w")
+    if not f then print("Failed to write settings file: " .. path); return end
+    f:write(settings_encode(settings))
+    f:close()
+end
+
+function remember_project_path(project_id, media_path)
+    local settings = load_project_settings()
+    settings[project_id] = media_path
+    save_project_settings(settings)
+end
+
+function recall_project_path(project_id)
+    local settings = load_project_settings()
+    return settings[project_id]
+end
+
+function try_auto_initialise()
+    -- Attempt to restore previous session path for this project without user interaction.
+    -- Returns the media path string on success, nil on failure.
+    refresh_project_globals()
+    if not _G.project_id then return nil end
+
+    local saved_path = recall_project_path(_G.project_id)
+    if not saved_path or saved_path == "" then return nil end
+
+    -- Validate the saved path still has a motionbridge folder
+    local paths = build_project_paths(saved_path)
+    if not file_exists(paths.json) then
+        print("MotionBridge: saved path no longer valid — " .. saved_path)
+        return nil
+    end
+
+    local success = initialise(saved_path, true)
+    return success and saved_path or nil
+end
+
+function ensure_connected()
+    -- Called at the top of every button handler.
+    -- Returns true if we have a valid connection, false otherwise.
+    -- Handles project switches by attempting silent reconnect from saved settings.
+
+    -- First update project globals (detects project switches, clears stale state)
+    local current_project = _G.resolve:GetProjectManager():GetCurrentProject()
+    if not current_project then
+        alert("No project open in DaVinci Resolve.")
+        return false
+    end
+    local current_project_id = current_project:GetUniqueId()
+
+    -- Already connected to the right project
+    if _G.json_path and file_exists(_G.json_path) and current_project_id == _G.project_id then
+        _G.project = current_project
+        _G.media_pool = _G.project:GetMediaPool()
+        _G.root_folder = _G.media_pool:GetRootFolder()
+        return true
+    end
+
+    -- Project has changed (or first run) — update globals and attempt silent reconnect
+    _G.project = current_project
+    _G.project_id = current_project_id
+    _G.media_pool = _G.project:GetMediaPool()
+    _G.root_folder = _G.media_pool:GetRootFolder()
+    _G.json_path = nil
+    _G.project_media_path = nil
+
+    local saved_path = recall_project_path(_G.project_id)
+
+    if saved_path and saved_path ~= "" then
+        local paths = build_project_paths(saved_path)
+        if file_exists(paths.json) then
+            -- Case 1: Path saved and valid — reconnect silently
+            local success = initialise(saved_path, true)
+            if success then
+                update_project_fps()
+                ui_items.BrandingLabel.ToolTip = "Project folder: " .. saved_path
+                return true
+            end
+            -- Init failed despite valid path (e.g. version mismatch) — fall through to picker
+        else
+            -- Case 2: Path saved but folder has moved — notify then open picker
+            alert("MotionBridge project folder not found at:\n" .. saved_path .. "\n\nPlease navigate to its new location.")
+            local chosenPath = fu:RequestDir("Select this project's motionbridge media folder...")
+            if not chosenPath or chosenPath == "" then return false end
+
+            _G.project_media_path = chosenPath:gsub("\\", "/"):gsub("/+$", "")
+            local success = initialise(_G.project_media_path)
+            if success then
+                update_project_fps()
+                ui_items.BrandingLabel.ToolTip = "Project folder: " .. _G.project_media_path
+            end
+            return success
+        end
+    end
+
+    -- Case 3: No saved path for this project — open picker directly
+    local chosenPath = fu:RequestDir("Select this project's motionbridge media folder...")
+    if not chosenPath or chosenPath == "" then return false end
+
+    _G.project_media_path = chosenPath:gsub("\\", "/"):gsub("/+$", "")
+    local success = initialise(_G.project_media_path)
+    if success then
+        update_project_fps()
+        ui_items.BrandingLabel.ToolTip = "Project folder: " .. _G.project_media_path
+    end
+    return success
+end
+
+function initialise(project_media_path, silent)    
     if not project_media_path or project_media_path == "" then
         alert("No media path provided.")
         return false
@@ -210,7 +388,9 @@ function initialise(project_media_path)
             end
             
             if not version_check() then return false end
-            alert("Link detected for current project: " .. _G.project:GetName() .. "\n\nRebinding...")
+            if not silent then
+                alert("Link detected for current project: " .. _G.project:GetName() .. "\n\nRebinding...")
+            end
             
             -- Validate directories exist
             local checks = {
@@ -242,6 +422,7 @@ function initialise(project_media_path)
             _G.project:SetCurrentTimeline(initial_timeline)
         end
 
+        remember_project_path(_G.project_id, project_media_path)
         return true
     end
 end
@@ -404,23 +585,10 @@ function refresh_project_globals()
     local current_project = _G.resolve:GetProjectManager():GetCurrentProject()
     if not current_project then
         alert("No project open in DaVinci Resolve.")
-        set_ui_enabled(false)
         return false
     end
-    
-    local current_project_id = current_project:GetUniqueId()
-    
-    if _G.json_path and file_exists(_G.json_path) then
-        local data = load_json_data(_G.json_path)
-        if data and data["projectid"] and current_project_id ~= data["projectid"] then 
-            alert("DaVinci project changed. Please re-initialise by clicking Browse.")
-            set_ui_enabled(false)
-            return false
-        end
-    end
-    
     _G.project = current_project
-    _G.project_id = current_project_id
+    _G.project_id = current_project:GetUniqueId()
     _G.media_pool = _G.project:GetMediaPool()
     _G.root_folder = _G.media_pool:GetRootFolder()
     return true
@@ -817,25 +985,45 @@ function confirm(message)
     })
 end
 
-function prompt_custom_settings()
+function prompt_new_comp_dialog()
+    -- Returns: { name, use_custom, customResolutionWidth, customResolutionHeight }
+    -- or nil if cancelled
     local ui = fu.UIManager
     local disp = bmd.UIDispatcher(ui)
+    local result = nil
+    local win_id = "NewCompDialog"
+
+    -- Build preset label list for the combo box
+    local preset_labels = {}
+    for _, p in ipairs(_G.CONSTANTS.RESOLUTION_PRESETS) do
+        table.insert(preset_labels, p.label)
+    end
 
     local win = disp:AddWindow({
-        ID = "CustomRes_" .. os.time(),
-        WindowTitle = "Custom AE Comp Resolution",
-        Geometry = {950, 400, 300, 150},
+        ID = win_id,
+        WindowTitle = "New Composition",
+        Geometry = {950, 400, 280, 180},
         ui:VGroup{
+            Spacing = 8,
             ui:HGroup{
-                ui:Label{ Text = "Width", Weight = 0.25 },
-                ui:LineEdit{ ID = "width", Text = tostring(_G.CONSTANTS.CUSTOM_SETTINGS.DEFAULT_WIDTH), Weight = 0.75 }
+                ui:Label{ Text = "Comp Name:", Weight = 0.35 },
+                ui:LineEdit{ ID = "name", PlaceholderText = "Enter comp name...", Weight = 0.65 }
             },
             ui:HGroup{
-                ui:Label{ Text = "Height", Weight = 0.25 },
-                ui:LineEdit{ ID = "height", Text = tostring(_G.CONSTANTS.CUSTOM_SETTINGS.DEFAULT_HEIGHT), Weight = 0.75 }
+                ui:Label{ Text = "Resolution:", Weight = 0.35 },
+                ui:ComboBox{ ID = "preset", Weight = 0.65 }
             },
             ui:HGroup{
-                ui:Button{ ID = "ok", Text = "OK" },
+                ID = "CustomGroup",
+                Visible = false,
+                ui:Label{ Text = "W × H:", Weight = 0.35 },
+                ui:LineEdit{ ID = "width",  Text = tostring(_G.CONSTANTS.CUSTOM_SETTINGS.DEFAULT_WIDTH),  Weight = 0.3 },
+                ui:Label{ Text = "×", Weight = 0, Alignment = {AlignHCenter = true} },
+                ui:LineEdit{ ID = "height", Text = tostring(_G.CONSTANTS.CUSTOM_SETTINGS.DEFAULT_HEIGHT), Weight = 0.3 }
+            },
+            ui:HGroup{
+                Spacing = 8,
+                ui:Button{ ID = "ok",     Text = "OK"     },
                 ui:Button{ ID = "cancel", Text = "Cancel" }
             }
         }
@@ -843,25 +1031,63 @@ function prompt_custom_settings()
 
     local items = win:GetItems()
 
+    -- Populate combo box
+    for _, label in ipairs(preset_labels) do
+        items.preset:AddItem(label)
+    end
+    items.preset.CurrentIndex = 0  -- "Match Project" default
+
+    function win.On.preset.CurrentIndexChanged(ev)
+        local idx = items.preset.CurrentIndex + 1  -- 1-based
+        local is_custom = (_G.CONSTANTS.RESOLUTION_PRESETS[idx].label == "Custom...")
+        items.CustomGroup.Visible = is_custom
+        win:RecalcLayout()
+    end
+
     function win.On.ok.Clicked(ev)
-        disp:ExitLoop({
-            customResolutionWidth = tonumber(items.width.Text) or _G.CONSTANTS.CUSTOM_SETTINGS.DEFAULT_WIDTH,
-            customResolutionHeight = tonumber(items.height.Text) or _G.CONSTANTS.CUSTOM_SETTINGS.DEFAULT_HEIGHT
-        })
+        local name = items.name.Text or ""
+        if name:match("^%s*$") then
+            alert("Please enter a valid comp name.")
+            return
+        end
+
+        local idx = items.preset.CurrentIndex + 1
+        local preset = _G.CONSTANTS.RESOLUTION_PRESETS[idx]
+        local use_custom = false
+        local custom_w, custom_h = nil, nil
+
+        if preset.label == "Custom..." then
+            use_custom = true
+            custom_w = tonumber(items.width.Text)  or _G.CONSTANTS.CUSTOM_SETTINGS.DEFAULT_WIDTH
+            custom_h = tonumber(items.height.Text) or _G.CONSTANTS.CUSTOM_SETTINGS.DEFAULT_HEIGHT
+        elseif preset.width ~= nil then
+            -- Named preset with explicit dimensions
+            use_custom = true
+            custom_w = preset.width
+            custom_h = preset.height
+        end
+        -- "Match Project" → use_custom stays false, custom_w/h stay nil
+
+        result = {
+            name = name,
+            use_custom = use_custom,
+            customResolutionWidth  = custom_w,
+            customResolutionHeight = custom_h
+        }
+        disp:ExitLoop()
     end
 
     function win.On.cancel.Clicked(ev)
-        disp:ExitLoop(nil)
+        disp:ExitLoop()
     end
 
-    function win.On.CustomRes_.Close(ev)
-        disp:ExitLoop(nil)
+    win.On[win_id .. ".Close"] = function(ev)
+        disp:ExitLoop()
     end
 
     win:Show()
-    local result = disp:RunLoop()
+    disp:RunLoop()
     win:Hide()
-
     return result
 end
 
@@ -2576,56 +2802,33 @@ _G.disp = bmd.UIDispatcher(ui)
 local MainWindow = disp:AddWindow({
     ID = "MainWind",
     WindowTitle = "MotionBridge",
-    Geometry = { 950, 400, 420, 360 },
+    Geometry = { 950, 400, 290, 270 },
 
     ui:VGroup{
         ID = "root",
         Spacing = 10,
         Weight = 0,
-        MaximumSize = { 950, 390 }, 
-        ui:Label{ Text = "Connect to Project Folder", Alignment = {AlignCenter = true}, Weight = 0, StyleSheet = TITLE_CSS },
+        MaximumSize = { 950, 300 }, 
         ui:VGroup{
-            ID = "ConnectToProjectPanel",
-            ToolTip = "Click Browse and navigate to the current project's Media folder.\nImportant: Each project has its own separate motionbridge folder.",
+            ID = "LinkCompositionsPanel",
+            ToolTip = "Import compositions linked from AE, or create a new linked nest from a placeholder clip.",
             Weight = 0,
             Spacing = 5,
+            ui:Label{ Text = "Link Compositions", Alignment = {AlignCenter = true}, Weight = 0, StyleSheet = TITLE_CSS },
             ui:HGroup{
                 Weight = 0,
-                ui:Label{ ID = "FolderLabel", Text = "Folder Path:", Weight = 0.18 },
-                ui:LineEdit{ ID = "FolderPath", PlaceholderText = "Select a folder...", ReadOnly = true, Weight = 0.62 },
-                ui:Button{ ID = "Browse", Text = _G.CONSTANTS.ICONS.openFolder .. " Browse", Weight = 0.20 }
+                ui:Button{ ID = "ImportNewComps", Text = _G.CONSTANTS.ICONS.downArrow .. " Import Linked Comps", Weight = 0.5 },
+                ui:Button{ ID = "InsertPlaceholderTimelineAtPlayhead", Text = _G.CONSTANTS.ICONS.downToBarArrow .. " Insert Placeholder", Weight = 0.5 }
             },
             ui:HGroup{
                 Weight = 0,
-                ui:Button{ ID = "ImportNewComps", Text = _G.CONSTANTS.ICONS.downArrow .. " Import Linked Comps", Weight = 0.20 }
-            },
-            ui:Label{ FrameStyle = 4, Weight = 0 }
-        },
-        ui:VGroup{
-            ID = "CreateCompositionPanel",
-            ToolTip = "1. Link AV clips with " .. _G.CONSTANTS.PLACEHOLDER_TL_NAME .. " clip (placeholder at top).\n2. Bring playhead over placeholder.\n3. Replace with nested timeline (AE comp draft).\n" .. _G.CONSTANTS.ICONS.downRightArrow .. " Optionally use custom resolution, otherwise uses project settings.\n4. Import new comp in AE.",  
-            Weight = 0,
-            Spacing = 5,
-            ui:Label{ Text = "Create Composition", Alignment = {AlignCenter = true}, Weight = 0, StyleSheet = TITLE_CSS },
-            ui:HGroup{
-                Weight = 0,
-                ui:Label{ ID = "CompNameLabel", Text = "Comp Name:", Weight = 0.18 },
-                ui:LineEdit{ ID = "CompName", PlaceholderText = "Enter new comp name...", Weight = 0.82 }
-            },
-            ui:HGroup{
-                Weight = 0,
-                ui:CheckBox{ ID = "UseCustomResolution", Text = "Use Custom Resolution", Checked = false, Weight = 1 },
-                ui:Button{ ID = "InsertPlaceholderTimelineAtPlayhead", Text = _G.CONSTANTS.ICONS.downToBarArrow .. " Insert Placeholder" }
-            },
-            ui:HGroup{
-                Weight = 0,
-                ui:Button{ ID = "NestLinkedInAEComp", Text = _G.CONSTANTS.ICONS.upArrow .. " Replace Linked Layers With Nested AE Comp" }          
+                ui:Button{ ID = "NestLinkedInAEComp", Text = _G.CONSTANTS.ICONS.upArrow .. " Replace Linked Layers With Nested AE Comp", Weight = 1 }          
             },
             ui:Label{ FrameStyle = 4, Weight = 0 }
         },
         ui:VGroup{
             ID = "LinkedNestPanel",
-            ToolTip = "Bring Playhead over nest clip from working timeline, or inside nested timeline.\nUse markers to communicate animation timings.\nRefresh Render keeps nest contents up to date.",  
+            ToolTip = "Bring playhead over a nest clip, or open the nested timeline.\nUse markers to share timing notes with AE.\nRefresh Render updates the nest with the latest AE render.",  
             Weight = 0,
             Spacing = 5,
             ui:Label{ Text = "Linked Nest", Alignment = {AlignCenter = true}, Weight = 0, StyleSheet = TITLE_CSS },
@@ -2648,7 +2851,8 @@ local MainWindow = disp:AddWindow({
             ui:HGroup{
                 Spacing = 5,
                 ui:TextEdit{ ID = "Logo", HTML = "<a href='" .. _G.CONSTANTS.WEBSITEURL .. "'><img src='".._G.CONSTANTS.ICONS.logoB64 .."' width='20' height='20' style='vertical-align:middle;'>", ReadOnly = true, FrameStyle = 0, FixedSize = {30, 30}, Events = { AnchorClicked = true }, Weight = 0},
-                ui:Label{ Text = "MotionBridge v" .. _G.CONSTANTS.MOTIONBRIDGE_VERSION .. " beta | " .. _G.CONSTANTS.ICONS.copyright .. " 2025-2026 Nathan Stassin ", Alignment = {AlignVCenter = true}, Weight = 0.8, StyleSheet = BRANDING_CSS},
+                ui:Label{ ID = "BrandingLabel", Text = "MotionBridge v" .. _G.CONSTANTS.MOTIONBRIDGE_VERSION .. " | " .. _G.CONSTANTS.ICONS.copyright .. " 2026 Nathan Stassin ", Alignment = {AlignVCenter = true}, Weight = 0.8, StyleSheet = BRANDING_CSS},
+                ui:Button{ ID = "Browse", Text = _G.CONSTANTS.ICONS.openFolder, Weight = 0, MinimumSize = {30, 30}, MaximumSize = {30, 30}, ToolTip = "Change project media folder" },
                 ui:Button{ ID = "Help", Text = _G.CONSTANTS.ICONS.help, Weight = 0, MinimumSize = {30, 30}, MaximumSize = {30, 30}, StyleSheet = BRANDING_CSS }
             }
         }
@@ -2668,46 +2872,49 @@ function set_ui_enabled(bool)
     ui_items.ImportNewComps.Enabled = bool
     ui_items.InsertPlaceholderTimelineAtPlayhead.Enabled = bool
     ui_items.NestLinkedInAEComp.Enabled = bool
-    ui_items.UseCustomResolution.Enabled = bool
     ui_items.ImportMarkers.Enabled = bool
     ui_items.ExportMarkers.Enabled = bool
     ui_items.RefreshRender.Enabled = bool
     -- ui_items.GenerateProxy.Enabled = bool
-    ui_items.CompName.Enabled = bool
 end
--- Disable all function buttons initially
-set_ui_enabled(false)
+
+-- Auto-initialise from saved path on startup (silent, best-effort)
+do
+    local restored_path = try_auto_initialise()
+    if restored_path then
+        ui_items.BrandingLabel.ToolTip = "Project folder: " .. restored_path
+    else
+        print("MotionBridge: no saved project path found. Click 📂 to connect.")
+    end
+    -- Always enable buttons — ensure_connected() handles the gate on each action
+    set_ui_enabled(true)
+end
 
 function MainWindow.On.Browse.Clicked(ev)
-    local chosenPath = fu:RequestDir("Choose MotionBridge Folder...")
+    local chosenPath = fu:RequestDir("Choose MotionBridge Project Media Folder...")
     if not chosenPath or chosenPath == "" then
         print("No folder selected.")
         return
     end
 
-    -- Normalise and store the path
     _G.project_media_path = chosenPath:gsub("\\", "/"):gsub("/+$", "")
-    ui_items.FolderPath.Text = _G.project_media_path
 
     local success = initialise(_G.project_media_path)
-    if not success then
-        set_ui_enabled(false)
-        return
-    end
+    if not success then return end
 
-    set_ui_enabled(true)
     update_project_fps()
-    if refresh_project_globals() == false then return end
+    refresh_project_globals()
+    ui_items.BrandingLabel.ToolTip = "Project folder: " .. _G.project_media_path
 end
 
 function MainWindow.On.ImportNewComps.Clicked(ev)
-    if refresh_project_globals() == false then return end
+    if not ensure_connected() then return end
     update_project_fps()
     import_new_comps()
 end 
 
 function MainWindow.On.InsertPlaceholderTimelineAtPlayhead.Clicked(ev)
-    if refresh_project_globals() == false then return end
+    if not ensure_connected() then return end
     update_project_fps()
     local success = insert_placeholder_timeline_at_playhead()
     if not success then
@@ -2716,35 +2923,43 @@ function MainWindow.On.InsertPlaceholderTimelineAtPlayhead.Clicked(ev)
 end
 
 function MainWindow.On.NestLinkedInAEComp.Clicked(ev)
-    if refresh_project_globals() == false then return end
+    if not ensure_connected() then return end
     update_project_fps()
-    local comp_name = ui_items.CompName.Text
-    if comp_name == "" then
-        alert("Please enter a comp name before creating.")
+
+    -- Validate placeholder is under the playhead before showing the dialog
+    local placeholder_mpi = get_mpi_by_name(_G.CONSTANTS.PLACEHOLDER_TL_NAME)
+    if not placeholder_mpi then
+        alert("Error: MotionBridgePlaceholder timeline not found in Media Pool.")
         return
     end
-    print("Running replace_linked_with_aecomp() with comp name: " .. comp_name)
-    local use_custom_settings = ui_items.UseCustomResolution.Checked
-    local custom_settings = nil
-
-    if use_custom_settings then
-        custom_settings = prompt_custom_settings()
-        if not custom_settings then
-            print("Cancelled custom settings input.")
-            return
-        end
+    local base_timeline = _G.project:GetCurrentTimeline()
+    if not base_timeline then
+        alert("Error: No active timeline.")
+        return
+    end
+    local placeholder = base_timeline:GetCurrentVideoItem()
+    if not placeholder or placeholder:GetName() ~= placeholder_mpi:GetName() then
+        alert("Error: No MotionBridgePlaceholder in top active video layer.\n\nBring the playhead over a placeholder clip before using this button.")
+        return
     end
 
-    replace_linked_with_aecomp(comp_name, use_custom_settings, custom_settings)
+    local comp_params = prompt_new_comp_dialog()
+    if not comp_params then return end
+
+    print("Running replace_linked_with_aecomp() with comp name: " .. comp_params.name)
+    replace_linked_with_aecomp(comp_params.name, comp_params.use_custom, {
+        customResolutionWidth  = comp_params.customResolutionWidth,
+        customResolutionHeight = comp_params.customResolutionHeight
+    })
 end
 
 function MainWindow.On.ImportMarkers.Clicked(ev)
-    if refresh_project_globals() == false then return end
+    if not ensure_connected() then return end
     if not import_markers() then alert(get_context_help_message("markers")) end
 end
 
 function MainWindow.On.ExportMarkers.Clicked(ev)
-    if refresh_project_globals() == false then return end
+    if not ensure_connected() then return end
     update_project_fps()
     if not export_markers() then 
         alert(get_context_help_message("markers"))
@@ -2754,10 +2969,9 @@ function MainWindow.On.ExportMarkers.Clicked(ev)
 end
 
 function MainWindow.On.RefreshRender.Clicked(ev)
-    if refresh_project_globals() == false then return end
+    if not ensure_connected() then return end
     update_project_fps()
     local refreshed = refresh_render()
-    -- Slightly janky solution to reset pointer - replace file with itself after refreshing it lmao - Solves extended duration render media offline bug 
     if refreshed then 
         replace_render_after_refresh() 
     else

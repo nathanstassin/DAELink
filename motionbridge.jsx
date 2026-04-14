@@ -30,6 +30,7 @@ function MotionBridge(thisObj) {
 
     Version History:
     - 0.9 Beta - 17/01/2026 
+    - 0.95 Beta - 14/04/2026 - UI improvements
     */ 
     // GLOBAL VARIABLES 
     var CONFIG = {
@@ -79,15 +80,14 @@ function MotionBridge(thisObj) {
             "• Initialise project in Davinci Resolve.",
             "• Each project has its own motionbridge folder, with subfolders:",
             "       " + ICONS.downRightArrow + " Renders: all renders from AE",
-            "       " + ICONS.downRightArrow + " Support: JSON file which contains link data",
-            "• " + ICONS.openFolder + " Browse button: navigate and connect to current motionbridge project folder (or media folder enclosing it)",
+            "       " + ICONS.downRightArrow + " Support: JSON file which contains link data"
         ],
         panelB : "Linking Compositions with Davinci Project " + ICONS.upArrow + " | " + ICONS.downArrow, 
         panelBbullets : [
             "• " + ICONS.upArrow + " Link Active Comp button establishes a link to a Davinci nest for currently active comp",
             "       " + ICONS.downRightArrow + " Click 'Import Linked Comps' button on Davinci side to finalise the link",
             "• " + ICONS.downArrow + " Import Linked Comps button finalises links established from Davinci",
-            "       " + ICONS.downRightArrow + " Click 'Replace Linked Layers With Nested AE Comp' button on Davinci side to establish the link"    
+            "       " + ICONS.downRightArrow + " Click 'Replace Linked Layers With Nested AE Comp' button in Davinci to establish link"    
         ],
         panelC : "Markers " + ICONS.upTriangle + " | " + ICONS.downTriangle,
         panelCbullets : [
@@ -166,25 +166,15 @@ function MotionBridge(thisObj) {
         myPanel.margins = STYLES.margins.mainPanel;
         myPanel.spacing = STYLES.spacing.mainPanel;
 
-        // PANEL 1 — Project Folder
-        var connectToProjectFolderPanel = myPanel.add("panel", undefined, "Connect to Project Folder");
-        setPanelMargins(connectToProjectFolderPanel, STYLES.margins.panel);
-        var hGroup0 = createButtonGroup(connectToProjectFolderPanel);
-        hGroup0.alignChildren = ["fill", "center"];
-        hGroup0.spacing = STYLES.spacing.horizontalGroup;
-        outputDir = hGroup0.add("statictext", undefined, "Browse to Project MotionBridge folder...");
-        outputDir.characters = STYLES.sizes.pathTextCharacters;
-        var browseBtn = hGroup0.add("button", undefined, ICONS.openFolder + " Browse");
-
-        // PANEL 2 — Linked Comps
+        // PANEL 1 — Link Compositions
         var linkCompositionsPanel = myPanel.add("panel", undefined, "Link Compositions");
         setPanelMargins(linkCompositionsPanel, STYLES.margins.panel);
         var hGroup1 = createButtonGroup(linkCompositionsPanel);
         var importNewCompsBtn = hGroup1.add("button", undefined, ICONS.downArrow + " Import Linked Comps");
         var linkActiveCompBtn = hGroup1.add("button", undefined, ICONS.upArrow + " Link Active Comp");
 
-        // PANEL 3 — Active Comp
-        var activeCompPanel = myPanel.add("panel", undefined, "Active Comp");
+        // PANEL 2 — Linked Active Comp
+        var activeCompPanel = myPanel.add("panel", undefined, "Linked Active Comp");
         setPanelMargins(activeCompPanel, STYLES.margins.panel);
 
         // Marker buttons
@@ -215,7 +205,7 @@ function MotionBridge(thisObj) {
         brandingColumn.orientation = "column";
         brandingColumn.alignChildren = ["left", "center"];
         brandingColumn.spacing = STYLES.spacing.brandingColumn;
-        brandingColumn.margins = [0, 0, 0, 0]; // No margins on text group
+        brandingColumn.margins = [0, 0, 0, 0];
         brandingColumn.add("statictext", undefined, CONFIG.scriptName + " - v" + CONFIG.version + " beta");
         var currentYear = new Date().getFullYear();
         var copyrightYear = currentYear > 2025 ? "2025-" + currentYear : "2025";
@@ -225,81 +215,117 @@ function MotionBridge(thisObj) {
         buttonGroup.alignment = ["right", "bottom"];
         buttonGroup.spacing = STYLES.spacing.buttonGroup;
         buttonGroup.margins = STYLES.margins.buttonGroup;
+        var browseBtn = createSquareButton(buttonGroup, ICONS.openFolder, "Change project folder");
         var helpButton = createSquareButton(buttonGroup, ICONS.help, "Help");
         helpButton.onClick = showHelpDialog;
 
-        // Resize handler
-        var uiElements = [browseBtn, importNewCompsBtn, linkActiveCompBtn, renderBtn, addToQBtn, importMarkersBtn, exportMarkersBtn, templateDropdown]; 
-        alignAndDisableUIElements(uiElements);
-        browseBtn.enabled = true; 
+        // All buttons start enabled — connection is resolved on first use
+        var uiElements = [importNewCompsBtn, linkActiveCompBtn, renderBtn, addToQBtn, importMarkersBtn, exportMarkersBtn, templateDropdown]; 
+        for (var i = 0; i < uiElements.length; i++) {
+            uiElements[i].alignment = ["fill", "center"];
+        }
         myPanel.onResizing = myPanel.onResize = function() { this.layout.resize(); }
 
-        // BUTTON LOGIC
-        function refreshProjectDisableUI() { 
-            if (!refreshProject()) {
-                alignAndDisableUIElements([importNewCompsBtn, linkActiveCompBtn, renderBtn, addToQBtn, importMarkersBtn, exportMarkersBtn, templateDropdown]);
-                return false;
+        // CONNECTION LOGIC
+        // Called at the top of every button handler.
+        // Returns true if we have a valid active connection, false otherwise.
+        function ensureConnected() {
+            // If we appear to be connected, validate that the project hasn't changed.
+            // refreshProject() nulls jsonFile/outputDir if there's a mismatch, so
+            // if it returns false we fall through to the reconnect logic below.
+            if (jsonFile && jsonFile.exists) {
+                if (refreshProject()) return true;
+                // Project changed — jsonFile is now null, fall through to reconnect
             }
-            return true; 
+
+            // Read the Davinci projectid from the 0_LinkedComps folder comment —
+            // this is the stable identity for this AE project's link
+            var projectID = getLinkedProjectID();
+
+            if (projectID) {
+                // This AE project has been linked — look up its saved folder path
+                var savedPath = loadProjectPath(projectID);
+
+                if (savedPath) {
+                    var testJson = new File(savedPath + "/" + CONFIG.directoryNames.root + "/" + CONFIG.directoryNames.support + "/" + CONFIG.fileNames.json);
+                    if (testJson.exists) {
+                        // Path still valid — connect silently
+                        JSONfilePath = savedPath + "/" + CONFIG.directoryNames.root + "/" + CONFIG.directoryNames.support + "/" + CONFIG.fileNames.json;
+                        jsonFile = new File(JSONfilePath);
+                        if (!versionCheck()) { jsonFile = null; return false; }
+                        if (findOrCreateMLFolders()) {
+                            outputDir = savedPath;
+                            if (templateDropdown.items.length <= 1) { loadTemplates(); templateDropdown.selection = 0; }
+                            return true;
+                        }
+                        jsonFile = null;
+                        return false;
+                    }
+                    // Linked, path saved, but folder has moved — ask to relocate
+                    alert("MotionBridge project folder not found at:\n" + savedPath + "\n\nPlease navigate to its new location.");
+                }
+                // Linked but no path in settings yet — fall through to folder picker
+            }
+            // No folder comment — first time connecting this AE project
+
+            var folder = Folder.selectDialog("Open this project's motionbridge folder");
+            if (!folder) return false;
+            return connectToFolder(folder);
         }
 
-        browseBtn.onClick = function () {
-            var folder = Folder.selectDialog("Open this project's motionbridge folder");
-            if (!folder) return;
-
-            // Detect if user selected the motionbridge folder directly
+        function connectToFolder(folder) {
             var normalizedPath = folder.fsName.replace(/\\/g, "/");
             var lowerPath = normalizedPath.toLowerCase();
-            
+
             if (lowerPath.match(new RegExp("/" + CONFIG.directoryNames.root + "/?$", "i"))) {
-                // User selected motionbridge folder, strip it off to get parent
                 var lastSlashIndex = normalizedPath.lastIndexOf("/motionbridge");
-                if (lastSlashIndex === -1) {
-                    lastSlashIndex = normalizedPath.lastIndexOf("/MotionBridge");
-                }
-                if (lastSlashIndex !== -1) {
-                    normalizedPath = normalizedPath.substring(0, lastSlashIndex);
-                    folder = new Folder(normalizedPath);
-                }
+                if (lastSlashIndex === -1) lastSlashIndex = normalizedPath.lastIndexOf("/MotionBridge");
+                if (lastSlashIndex !== -1) normalizedPath = normalizedPath.substring(0, lastSlashIndex);
             }
 
-            // Check if motionbridge folder exists in the selected parent folder
-            var motionbridgeFolder = new Folder(folder.fsName + "/motionbridge");
+            var motionbridgeFolder = new Folder(normalizedPath + "/motionbridge");
             if (!motionbridgeFolder.exists) {
-                alert("No motionbridge folder found!");
-                alignAndDisableUIElements([importNewCompsBtn, linkActiveCompBtn, renderBtn, addToQBtn, importMarkersBtn, exportMarkersBtn, templateDropdown]);
-                return;
+                alert("No motionbridge folder found at that location.");
+                return false;
             }
 
-            JSONfilePath = folder.fsName + "/" + CONFIG.directoryNames.root + "/" + CONFIG.directoryNames.support + "/" + CONFIG.fileNames.json;
+            JSONfilePath = normalizedPath + "/" + CONFIG.directoryNames.root + "/" + CONFIG.directoryNames.support + "/" + CONFIG.fileNames.json;
             jsonFile = new File(JSONfilePath);
 
-            if (!versionCheck()) {
-                alignAndDisableUIElements([importNewCompsBtn, linkActiveCompBtn, renderBtn, addToQBtn, importMarkersBtn, exportMarkersBtn, templateDropdown]);
-                return;
-            }
+            if (!versionCheck()) { jsonFile = null; return false; }
 
+            // findOrCreateMLFolders writes the Davinci projectid into the folder comment
+            // (or validates it if already set). After it runs, getLinkedProjectID() is reliable.
             if (findOrCreateMLFolders()) {
-                outputDir.text = folder.fsName;
-                importNewCompsBtn.enabled = true;
-                linkActiveCompBtn.enabled = true;
-                renderBtn.enabled = true;
-                addToQBtn.enabled = true;
-                importMarkersBtn.enabled = true;
-                exportMarkersBtn.enabled = true;
-                templateDropdown.enabled = true;
-                loadTemplates();
-                templateDropdown.selection = 0;
+                outputDir = normalizedPath;
+                var projectID = getLinkedProjectID();
+                if (projectID) saveProjectPath(projectID, outputDir);
+                if (templateDropdown.items.length <= 1) { loadTemplates(); templateDropdown.selection = 0; }
+                return true;
             }
+            jsonFile = null;
+            return false;
+        }
+
+        // BUTTON HANDLERS
+        browseBtn.onClick = function () {
+            // Force a fresh folder selection regardless of current state
+            jsonFile = null;
+            outputDir = null;
+            var folder = Folder.selectDialog("Open this project's motionbridge folder");
+            if (!folder) return;
+            connectToFolder(folder);
         };
 
         importNewCompsBtn.onClick = function () { 
-            if (!refreshProjectDisableUI()) return;
+            if (!ensureConnected()) return;
+            if (!refreshProject()) return;
             importNewComps();
         };
 
         linkActiveCompBtn.onClick = function () {
-            if (!refreshProjectDisableUI()) return;
+            if (!ensureConnected()) return;
+            if (!refreshProject()) return;
             activeComp = app.project.activeItem;
             if (activeComp && activeComp instanceof CompItem) {
                 linkWithDavinci();
@@ -307,31 +333,83 @@ function MotionBridge(thisObj) {
         };
 
         renderBtn.onClick = function () {
-            if (!refreshProjectDisableUI()) return;
+            if (!ensureConnected()) return;
+            if (!refreshProject()) return;
             if (refreshComp() && addToQ(templateDropdown)) app.project.renderQueue.render();
         };
 
         addToQBtn.onClick = function () {
-            if (!refreshProjectDisableUI()) return;
+            if (!ensureConnected()) return;
+            if (!refreshProject()) return;
             if (refreshComp()) addToQ(templateDropdown);
         };
 
         importMarkersBtn.onClick = function () {
-            if (!refreshProjectDisableUI()) return;
+            if (!ensureConnected()) return;
+            if (!refreshProject()) return;
             if (refreshComp()) importMarkers();
         };
 
         exportMarkersBtn.onClick = function () {
-            if (!refreshProjectDisableUI()) return;
+            if (!ensureConnected()) return;
+            if (!refreshProject()) return;
             if (refreshComp()) exportMarkers();
         };
 
         templateDropdown.onActivate = function () {
-            if (!refreshProjectDisableUI()) return;
+            if (!ensureConnected()) return;
             if (templateDropdown.items.length <= 1) loadTemplates();
         };
 
         return myPanel;
+    }
+
+    // SETTINGS PERSISTENCE
+    // app.settings holds one entry: SETTINGS_DICT_KEY → JSON string of
+    // { "davinci_project_uuid": "/folder/path", ... }
+    // The key for each project is the Davinci projectid, read from the
+    // 0_LinkedComps folder comment — the same anchor already used by the script.
+    var SETTINGS_SECTION = CONFIG.scriptName;
+    var SETTINGS_DICT_KEY = "projectFolderMap";
+
+    function loadSettingsDict() {
+        try {
+            if (app.settings.haveSetting(SETTINGS_SECTION, SETTINGS_DICT_KEY)) {
+                return JSON.parse(app.settings.getSetting(SETTINGS_SECTION, SETTINGS_DICT_KEY));
+            }
+        } catch(e) {}
+        return {};
+    }
+
+    function saveSettingsDict(dict) {
+        try {
+            app.settings.saveSetting(SETTINGS_SECTION, SETTINGS_DICT_KEY, JSON.stringify(dict));
+        } catch(e) {}
+    }
+
+    function getLinkedProjectID() {
+        // Read the Davinci projectid from the 0_LinkedComps folder comment.
+        // Returns the ID string, or null if no linked folder exists in this AE project.
+        var prefix = CONFIG.projectIDPrefix;
+        var matches = findFoldersByName(CONFIG.folderNames.linkedComps, null);
+        if (matches.length === 1) {
+            var comment = matches[0].comment || "";
+            if (comment.indexOf(prefix) === 0) {
+                return comment.substring(prefix.length);
+            }
+        }
+        return null;
+    }
+
+    function saveProjectPath(projectID, folderPath) {
+        var dict = loadSettingsDict();
+        dict[projectID] = folderPath;
+        saveSettingsDict(dict);
+    }
+
+    function loadProjectPath(projectID) {
+        var dict = loadSettingsDict();
+        return dict[projectID] || null;
     }
 
     // UI HELPERS
@@ -585,14 +663,18 @@ function MotionBridge(thisObj) {
 
         if (linkedMatches.length === 1) {
             var foundFolder = linkedMatches[0];
-            if (foundFolder.comment !== CONFIG.projectIDPrefix + data.projectid) { 
-                alert("This AE project is linked to a different Motion Link Project ID.\nPlease navigate to the current project motionbridge folder by clicking Browse.");
+            if (foundFolder.comment !== CONFIG.projectIDPrefix + data.projectid) {
+                // Project has changed — reset connection so ensureConnected re-runs cleanly
+                jsonFile = null;
+                outputDir = null;
                 return false;
             }
-            else {
-                return true; 
-            }
+            return true;
         }
+
+        // No linked folder found — also reset so ensureConnected handles it
+        jsonFile = null;
+        outputDir = null;
         return false; 
     }
 
@@ -794,7 +876,7 @@ function MotionBridge(thisObj) {
         var outputModule = renderQueueItem.outputModules[1];
         outputModule.applyTemplate(templateDropdown.selection);
 
-        var renderPath = outputDir.text + "/" + CONFIG.directoryNames.root + "/" + CONFIG.directoryNames.renders + "/" + activeComp.name;
+        var renderPath = outputDir + "/" + CONFIG.directoryNames.root + "/" + CONFIG.directoryNames.renders + "/" + activeComp.name;
         data.compositions[findCompKeyByAeID(data, activeComp.id)].renderPath = renderPath;
         data.compositions[findCompKeyByAeID(data, activeComp.id)].duration = activeComp.duration * activeComp.frameRate; // Update in case of changes
         writeToJSON(data);
