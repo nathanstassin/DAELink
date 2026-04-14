@@ -1,6 +1,6 @@
 function MotionBridge(thisObj) {
     /*
-    MotionBridge  | v0.9 Beta | © 2025-2026 Nathan Stassin
+    MotionBridge  | v0.95 Beta | © 2025-2026 Nathan Stassin
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -35,7 +35,8 @@ function MotionBridge(thisObj) {
     // GLOBAL VARIABLES 
     var CONFIG = {
         scriptName: "MotionBridge",
-        version: 0.9,
+        version: 0.95,
+        schemaVersion: 1,
         websiteurl: "https://nathanstassin.com/motionbridge",
         projectIDPrefix: "MotionBridgeProjectID:",
         folderNames: {
@@ -140,7 +141,7 @@ function MotionBridge(thisObj) {
     var jsonFile;
     var linkedCompsFolder;
     var importedMediaFolder;
-    var outputDir, templateDropdown;
+    var projectMediaPath, templateDropdown;
     var activeComp = app.project.activeItem;
 
     (function(passedObj) {
@@ -229,13 +230,25 @@ function MotionBridge(thisObj) {
         // CONNECTION LOGIC
         // Called at the top of every button handler.
         // Returns true if we have a valid active connection, false otherwise.
-        function ensureConnected() {
-            // If we appear to be connected, validate that the project hasn't changed.
-            // refreshProject() nulls jsonFile/outputDir if there's a mismatch, so
-            // if it returns false we fall through to the reconnect logic below.
+        function connectToProject() {
+            // If we appear to be connected, validate that the AE project hasn't changed
+            // by checking the 0_LinkedComps folder comment against the JSON's projectid.
+            // On mismatch/missing: null state and fall through to reconnect logic.
             if (jsonFile && jsonFile.exists) {
-                if (refreshProject()) return true;
-                // Project changed — jsonFile is now null, fall through to reconnect
+                var data = loadJSONData();
+                var linkedMatches = findFoldersByName(CONFIG.folderNames.linkedComps, null);
+
+                if (linkedMatches.length > 1) {
+                    alert("Multiple folders named '" + CONFIG.folderNames.linkedComps + "' found. Please resolve before continuing.");
+                    return false;
+                }
+
+                if (linkedMatches.length === 1 && linkedMatches[0].comment === CONFIG.projectIDPrefix + data.projectid) {
+                    return true;
+                }
+
+                jsonFile = null;
+                projectMediaPath = null;
             }
 
             // Read the Davinci projectid from the 0_LinkedComps folder comment —
@@ -253,8 +266,8 @@ function MotionBridge(thisObj) {
                         JSONfilePath = savedPath + "/" + CONFIG.directoryNames.root + "/" + CONFIG.directoryNames.support + "/" + CONFIG.fileNames.json;
                         jsonFile = new File(JSONfilePath);
                         if (!versionCheck()) { jsonFile = null; return false; }
-                        if (findOrCreateMLFolders()) {
-                            outputDir = savedPath;
+                        if (findOrCreateMotionBridgeFolders()) {
+                            projectMediaPath = savedPath;
                             if (templateDropdown.items.length <= 1) { loadTemplates(); templateDropdown.selection = 0; }
                             return true;
                         }
@@ -294,12 +307,12 @@ function MotionBridge(thisObj) {
 
             if (!versionCheck()) { jsonFile = null; return false; }
 
-            // findOrCreateMLFolders writes the Davinci projectid into the folder comment
+            // findOrCreateMotionBridgeFolders writes the Davinci projectid into the folder comment
             // (or validates it if already set). After it runs, getLinkedProjectID() is reliable.
-            if (findOrCreateMLFolders()) {
-                outputDir = normalizedPath;
+            if (findOrCreateMotionBridgeFolders()) {
+                projectMediaPath = normalizedPath;
                 var projectID = getLinkedProjectID();
-                if (projectID) saveProjectPath(projectID, outputDir);
+                if (projectID) saveProjectPath(projectID, projectMediaPath);
                 if (templateDropdown.items.length <= 1) { loadTemplates(); templateDropdown.selection = 0; }
                 return true;
             }
@@ -311,21 +324,19 @@ function MotionBridge(thisObj) {
         browseBtn.onClick = function () {
             // Force a fresh folder selection regardless of current state
             jsonFile = null;
-            outputDir = null;
+            projectMediaPath = null;
             var folder = Folder.selectDialog("Open this project's motionbridge folder");
             if (!folder) return;
             connectToFolder(folder);
         };
 
         importNewCompsBtn.onClick = function () { 
-            if (!ensureConnected()) return;
-            if (!refreshProject()) return;
+            if (!connectToProject()) return;
             importNewComps();
         };
 
         linkActiveCompBtn.onClick = function () {
-            if (!ensureConnected()) return;
-            if (!refreshProject()) return;
+            if (!connectToProject()) return;
             activeComp = app.project.activeItem;
             if (activeComp && activeComp instanceof CompItem) {
                 linkWithDavinci();
@@ -333,31 +344,27 @@ function MotionBridge(thisObj) {
         };
 
         renderBtn.onClick = function () {
-            if (!ensureConnected()) return;
-            if (!refreshProject()) return;
+            if (!connectToProject()) return;
             if (refreshComp() && addToQ(templateDropdown)) app.project.renderQueue.render();
         };
 
         addToQBtn.onClick = function () {
-            if (!ensureConnected()) return;
-            if (!refreshProject()) return;
+            if (!connectToProject()) return;
             if (refreshComp()) addToQ(templateDropdown);
         };
 
         importMarkersBtn.onClick = function () {
-            if (!ensureConnected()) return;
-            if (!refreshProject()) return;
+            if (!connectToProject()) return;
             if (refreshComp()) importMarkers();
         };
 
         exportMarkersBtn.onClick = function () {
-            if (!ensureConnected()) return;
-            if (!refreshProject()) return;
+            if (!connectToProject()) return;
             if (refreshComp()) exportMarkers();
         };
 
         templateDropdown.onActivate = function () {
-            if (!ensureConnected()) return;
+            if (!connectToProject()) return;
             if (templateDropdown.items.length <= 1) loadTemplates();
         };
 
@@ -372,7 +379,7 @@ function MotionBridge(thisObj) {
     var SETTINGS_SECTION = CONFIG.scriptName;
     var SETTINGS_DICT_KEY = "projectFolderMap";
 
-    function loadSettingsDict() {
+    function loadProjectSettings() {
         try {
             if (app.settings.haveSetting(SETTINGS_SECTION, SETTINGS_DICT_KEY)) {
                 return JSON.parse(app.settings.getSetting(SETTINGS_SECTION, SETTINGS_DICT_KEY));
@@ -381,7 +388,7 @@ function MotionBridge(thisObj) {
         return {};
     }
 
-    function saveSettingsDict(dict) {
+    function saveProjectSettings(dict) {
         try {
             app.settings.saveSetting(SETTINGS_SECTION, SETTINGS_DICT_KEY, JSON.stringify(dict));
         } catch(e) {}
@@ -402,13 +409,13 @@ function MotionBridge(thisObj) {
     }
 
     function saveProjectPath(projectID, folderPath) {
-        var dict = loadSettingsDict();
+        var dict = loadProjectSettings();
         dict[projectID] = folderPath;
-        saveSettingsDict(dict);
+        saveProjectSettings(dict);
     }
 
     function loadProjectPath(projectID) {
-        var dict = loadSettingsDict();
+        var dict = loadProjectSettings();
         return dict[projectID] || null;
     }
 
@@ -651,49 +658,24 @@ function MotionBridge(thisObj) {
         return matches;
     }
 
-    function refreshProject() {
-        var data = getJSONFileData();
-        var targetRootName = CONFIG.folderNames.linkedComps;
-        var linkedMatches = findFoldersByName(targetRootName, null);
-
-        if (linkedMatches.length > 1) {
-            alert("Multiple folders named '" + targetRootName + "' found. Please resolve before continuing.");
-            return false;
-        }
-
-        if (linkedMatches.length === 1) {
-            var foundFolder = linkedMatches[0];
-            if (foundFolder.comment !== CONFIG.projectIDPrefix + data.projectid) {
-                // Project has changed — reset connection so ensureConnected re-runs cleanly
-                jsonFile = null;
-                outputDir = null;
-                return false;
-            }
-            return true;
-        }
-
-        // No linked folder found — also reset so ensureConnected handles it
-        jsonFile = null;
-        outputDir = null;
-        return false; 
-    }
-
     function versionCheck() {
-        var data = getJSONFileData();
+        var data = loadJSONData();
         if (!data) return false;
-        
-        var scriptVersion = CONFIG.version;
-        var savedVersion = data.motionBridgeVersion;
-        
-        if (savedVersion !== scriptVersion) {
-            alert("Version mismatch detected.\n\nProject: v" + savedVersion + "\nCurrent: v" + scriptVersion + "\n\nPlease use MotionBridge v" + savedVersion + " in both AE and Resolve for this project.");
+
+        // schemaVersion gates cross-script JSON compatibility. Pre-0.95 projects
+        // have no schemaVersion field; treat them as schema 1.
+        var savedSchema = data.schemaVersion || 1;
+        var scriptSchema = CONFIG.schemaVersion;
+
+        if (savedSchema !== scriptSchema) {
+            alert("MotionBridge schema mismatch detected.\n\nProject schema: v" + savedSchema + "\nScript schema: v" + scriptSchema + "\n\nThe project was created by an incompatible version of MotionBridge. Please align script versions in both AE and Resolve.");
             return false;
         }
         return true;
     }
 
     function linkWithDavinci() {
-        var data = getJSONFileData();
+        var data = loadJSONData();
         if (!data || !data.compositions) {
             alert("No compositions found – please set up project in Davinci");
             return;
@@ -767,7 +749,7 @@ function MotionBridge(thisObj) {
         getOrCreateMarkersLayer(activeComp);
         activeComp.parentFolder = linkedCompsFolder;
 
-        writeToJSON(data, "Linked active comp as " + newKey);
+        saveJSONData(data, "Linked active comp as " + newKey);
     }
 
     function importNewComps() {
@@ -778,7 +760,7 @@ function MotionBridge(thisObj) {
             return;
         }
 
-        var data = getJSONFileData();
+        var data = loadJSONData();
 
         // Make sure compositions exist in JSON
         if (!data.compositions) {
@@ -798,7 +780,7 @@ function MotionBridge(thisObj) {
                     var currentComp = app.project.items.addComp(compData.name, compData.resolutionWidth, compData.resolutionHeight, 1, compData.duration / fps, fps);
                     currentComp.parentFolder = linkedCompsFolder;
                     data.compositions[davinciCompID].aeID = currentComp.id;
-                    writeToJSON(data);
+                    saveJSONData(data);
                     currentComp.openInViewer();
                     
                     // Import and add layers 
@@ -806,7 +788,7 @@ function MotionBridge(thisObj) {
 
                     // Cleanup - remove layers from json once transferred 
                     compData.layers = null; 
-                    writeToJSON(data);
+                    saveJSONData(data);
 
                     // Create markers from JSON data
                     var markersLayer = getOrCreateMarkersLayer(currentComp);
@@ -830,7 +812,7 @@ function MotionBridge(thisObj) {
                 if (findCompByID(data.compositions[davinciCompID].aeID) == null) {
                     var obsoleteCompName = data.compositions[davinciCompID].name; 
                     delete data.compositions[davinciCompID];
-                    writeToJSON(data, "Removed deleted composition from JSON: " + obsoleteCompName);
+                    saveJSONData(data, "Removed deleted composition from JSON: " + obsoleteCompName);
                     btnClickResult = true; 
                 }
             }   
@@ -842,7 +824,7 @@ function MotionBridge(thisObj) {
 
     // RENDER HELPERS
     function refreshComp() {
-        var data = getJSONFileData();
+        var data = loadJSONData();
         if (!data) return;
 
         activeComp = app.project.activeItem;
@@ -863,7 +845,7 @@ function MotionBridge(thisObj) {
     }
 
     function addToQ(templateDropdown) { 
-        var data = getJSONFileData();
+        var data = loadJSONData();
         if (!data) return;
 
         if (templateDropdown.selection && 
@@ -876,10 +858,10 @@ function MotionBridge(thisObj) {
         var outputModule = renderQueueItem.outputModules[1];
         outputModule.applyTemplate(templateDropdown.selection);
 
-        var renderPath = outputDir + "/" + CONFIG.directoryNames.root + "/" + CONFIG.directoryNames.renders + "/" + activeComp.name;
+        var renderPath = projectMediaPath + "/" + CONFIG.directoryNames.root + "/" + CONFIG.directoryNames.renders + "/" + activeComp.name;
         data.compositions[findCompKeyByAeID(data, activeComp.id)].renderPath = renderPath;
         data.compositions[findCompKeyByAeID(data, activeComp.id)].duration = activeComp.duration * activeComp.frameRate; // Update in case of changes
-        writeToJSON(data);
+        saveJSONData(data);
         
         outputModule.file = new File(renderPath);
         return outputModule;
@@ -933,8 +915,8 @@ function MotionBridge(thisObj) {
     }
 
     // MARKER HELPERS
-    function findOrCreateMLFolders() {
-        var data = getJSONFileData();
+    function findOrCreateMotionBridgeFolders() {
+        var data = loadJSONData();
         var targetRootName = CONFIG.folderNames.linkedComps;
         var targetSubName  = CONFIG.folderNames.importedMedia;
 
@@ -949,7 +931,7 @@ function MotionBridge(thisObj) {
         if (linkedMatches.length === 1) {
             linkedCompsFolder = linkedMatches[0];
             if (linkedCompsFolder.comment !== CONFIG.projectIDPrefix + data.projectid) { 
-                alert("This AE project is linked to a different Motion Link Project ID");
+                alert("This AE project is linked to a different MotionBridge project ID");
                 linkedCompsFolder = null;
                 return null;
             }
@@ -1068,7 +1050,7 @@ function MotionBridge(thisObj) {
     }
 
     function importMarkers() {
-        var data = getJSONFileData();
+        var data = loadJSONData();
         if (!data) return;
 
         var compData = data.compositions[findCompKeyByAeID(data, activeComp.id)];
@@ -1094,7 +1076,7 @@ function MotionBridge(thisObj) {
     }
 
     function exportMarkers() {
-        var data = getJSONFileData();
+        var data = loadJSONData();
         if (!data) return;
 
         var markersLayer = getOrCreateMarkersLayer(activeComp);
@@ -1114,7 +1096,7 @@ function MotionBridge(thisObj) {
 
         data.compositions[findCompKeyByAeID(data, activeComp.id)].markers = markers;
 
-        writeToJSON(data, markers.length + " markers exported from " + activeComp.name);
+        saveJSONData(data, markers.length + " markers exported from " + activeComp.name);
     }
 
     function findCompByID(aeCompID) {
@@ -1168,9 +1150,9 @@ function MotionBridge(thisObj) {
         }
     }
 
-    function writeToJSON(data, successMessage) {
+    function saveJSONData(data, successMessage) {
         if (!data) {
-            alert("No data provided to writeToJSON()");
+            alert("No data provided to saveJSONData()");
             return false;
         }
 
@@ -1197,7 +1179,7 @@ function MotionBridge(thisObj) {
         return true;
     }
 
-    function getJSONFileData() {
+    function loadJSONData() {
         if (!jsonFile.exists) {
             alert("JSON file not found!");
             return false;

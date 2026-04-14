@@ -1,5 +1,5 @@
 --[[
-    MotionBridge | v0.9 Beta | © 2025-2026 Nathan Stassin
+    MotionBridge | v0.95 Beta | © 2025-2026 Nathan Stassin
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -57,7 +57,8 @@ do
 end
 
 _G.CONSTANTS = {
-    MOTIONBRIDGE_VERSION = 0.9,
+    MOTIONBRIDGE_VERSION = 0.95,
+    SCHEMA_VERSION = 1,
     PLACEHOLDER_TL_NAME = "0_MotionBridgePlaceholder",
     FOLDER_NAMES = {
         MOTIONBRIDGE = "0_MotionBridge",
@@ -217,13 +218,13 @@ function save_project_settings(settings)
     f:close()
 end
 
-function remember_project_path(project_id, media_path)
+function save_project_path(project_id, media_path)
     local settings = load_project_settings()
     settings[project_id] = media_path
     save_project_settings(settings)
 end
 
-function recall_project_path(project_id)
+function load_project_path(project_id)
     local settings = load_project_settings()
     return settings[project_id]
 end
@@ -234,7 +235,7 @@ function try_auto_initialise()
     refresh_project_globals()
     if not _G.project_id then return nil end
 
-    local saved_path = recall_project_path(_G.project_id)
+    local saved_path = load_project_path(_G.project_id)
     if not saved_path or saved_path == "" then return nil end
 
     -- Validate the saved path still has a motionbridge folder
@@ -248,12 +249,27 @@ function try_auto_initialise()
     return success and saved_path or nil
 end
 
-function ensure_connected()
+function connect_to_folder(chosen_path, silent)
+    -- Normalise a picked or recalled path and run full initialisation.
+    -- Mirrors JSX's connectToFolder(folder). Used by connect_to_project() for
+    -- both silent reconnect (silent=true) and user-picker paths. initialise()
+    -- sets _G.project_media_path on success only, so failure leaves state clean.
+    if not chosen_path or chosen_path == "" then return false end
+
+    local normalised = chosen_path:gsub("\\", "/"):gsub("/+$", "")
+    local success = initialise(normalised, silent)
+    if success then
+        update_project_fps()
+        ui_items.BrandingLabel.ToolTip = "Project folder: " .. _G.project_media_path
+    end
+    return success
+end
+
+function connect_to_project()
     -- Called at the top of every button handler.
     -- Returns true if we have a valid connection, false otherwise.
     -- Handles project switches by attempting silent reconnect from saved settings.
 
-    -- First update project globals (detects project switches, clears stale state)
     local current_project = _G.resolve:GetProjectManager():GetCurrentProject()
     if not current_project then
         alert("No project open in DaVinci Resolve.")
@@ -269,7 +285,7 @@ function ensure_connected()
         return true
     end
 
-    -- Project has changed (or first run) — update globals and attempt silent reconnect
+    -- Project has changed (or first run) — update globals and clear stale state
     _G.project = current_project
     _G.project_id = current_project_id
     _G.media_pool = _G.project:GetMediaPool()
@@ -277,181 +293,173 @@ function ensure_connected()
     _G.json_path = nil
     _G.project_media_path = nil
 
-    local saved_path = recall_project_path(_G.project_id)
+    local saved_path = load_project_path(_G.project_id)
 
     if saved_path and saved_path ~= "" then
         local paths = build_project_paths(saved_path)
         if file_exists(paths.json) then
             -- Case 1: Path saved and valid — reconnect silently
-            local success = initialise(saved_path, true)
-            if success then
-                update_project_fps()
-                ui_items.BrandingLabel.ToolTip = "Project folder: " .. saved_path
-                return true
-            end
+            if connect_to_folder(saved_path, true) then return true end
             -- Init failed despite valid path (e.g. version mismatch) — fall through to picker
         else
-            -- Case 2: Path saved but folder has moved — notify then open picker
+            -- Case 2: Path saved but folder has moved — notify, then fall through to picker
             alert("MotionBridge project folder not found at:\n" .. saved_path .. "\n\nPlease navigate to its new location.")
-            local chosenPath = fu:RequestDir("Select this project's motionbridge media folder...")
-            if not chosenPath or chosenPath == "" then return false end
-
-            _G.project_media_path = chosenPath:gsub("\\", "/"):gsub("/+$", "")
-            local success = initialise(_G.project_media_path)
-            if success then
-                update_project_fps()
-                ui_items.BrandingLabel.ToolTip = "Project folder: " .. _G.project_media_path
-            end
-            return success
         end
     end
 
-    -- Case 3: No saved path for this project — open picker directly
-    local chosenPath = fu:RequestDir("Select this project's motionbridge media folder...")
-    if not chosenPath or chosenPath == "" then return false end
-
-    _G.project_media_path = chosenPath:gsub("\\", "/"):gsub("/+$", "")
-    local success = initialise(_G.project_media_path)
-    if success then
-        update_project_fps()
-        ui_items.BrandingLabel.ToolTip = "Project folder: " .. _G.project_media_path
-    end
-    return success
+    -- Case 2 (folder moved) or Case 3 (no saved path) — open picker
+    local chosen_path = fu:RequestDir("Select this project's motionbridge media folder...")
+    return connect_to_folder(chosen_path)
 end
 
-function initialise(project_media_path, silent)    
+function initialise(project_media_path, silent)
+    -- Globals (_G.project_media_path, _G.json_path) are only set on the success
+    -- path at the end of this function. All failure paths leave them untouched
+    -- so connect_to_project()'s "already connected" check can't be fooled by
+    -- half-initialised state.
     if not project_media_path or project_media_path == "" then
-        alert("No media path provided.")
+        notify(silent, "No media path provided.")
         return false
     end
 
     -- Normalise path: convert backslashes to forward slashes and remove trailing slashes
     project_media_path = project_media_path:gsub("\\", "/"):gsub("/+$", "")
-    
+
     local normalised_path = project_media_path
     local lower_path = normalised_path:lower()
-    
+
     if lower_path:match("/motionbridge/?$") then
         -- User selected motionbridge folder, strip it off to get parent
         project_media_path = normalised_path:match("^(.*)/[mM][oO][tT][iI][oO][nN][bB][rR][iI][dD][gG][eE]/?$")
     end
 
     local paths = build_project_paths(project_media_path)
-    
-    -- Store the normalised project_media_path globally
-    _G.project_media_path = project_media_path
+    if not paths then return false end
 
-    if paths then 
-        _G.json_path = paths.json        
-        refresh_project_globals()
-        
-        local initial_timeline = _G.project:GetCurrentTimeline()        
-        local placeholder_state = validate_placeholder()
+    refresh_project_globals()
 
-        if not placeholder_state then 
-            return false 
-        end
+    local initial_timeline = _G.project:GetCurrentTimeline()
+    local placeholder_state = validate_placeholder(silent)
 
-        local is_first_init = placeholder_state == "missing"
-        
-        if is_first_init then
-            if not confirm("No Link detected for current project: " .. _G.project:GetName() .. "\n\nInitialise link?") then
-                alert("User cancelled link initialisation. Aborting.")
-                return false
-            end
-                        
-            -- Create directories
-            for i, path in ipairs({paths.root, paths.support, paths.renders}) do
-                if not create_directory(path) then 
-                    return false 
-                end
-            end
-            
-            _G.json_path = paths.json
-            
-            get_motionbridge_folders()
-            
-            if not create_placeholder_timeline() then 
-                return false 
-            end
-            
-            if not initialise_json() then 
-                return false 
-            end
-            
-            alert("MotionBridge Project initialised!\n Connect to same folder from AE using MotionBridge panel.")
-        else
-            -- Check if motionbridge folder exists in selected parent folder
-            if not directory_exists(paths.root) then
-                alert("No motionbridge folder found!")
-                return false
-            end
-            
-            if not version_check() then return false end
-            if not silent then
-                alert("Link detected for current project: " .. _G.project:GetName() .. "\n\nRebinding...")
-            end
-            
-            -- Validate directories exist
-            local checks = {
-                {paths.root, "MotionBridge folder not found at selected media path."},
-                {paths.support, "MotionBridge/Support folder missing."},
-                {paths.renders, "MotionBridge/Renders folder missing."}
-            }
-            
-            for _, check in ipairs(checks) do
-                if not directory_exists(check[1]) then
-                    alert(check[2])
-                    return false
-                end
-            end
-            
-            if not file_exists(paths.json) then
-                alert("motionbridge.json not found. Cannot rebind.")
-                return false
-            end
-            
-            _G.json_path = paths.json
-            
-            if not load_and_validate_json() then return false end
-            
-            get_motionbridge_folders()
-        end
-
-        if initial_timeline then
-            _G.project:SetCurrentTimeline(initial_timeline)
-        end
-
-        remember_project_path(_G.project_id, project_media_path)
-        return true
+    if not placeholder_state then
+        return false
     end
+
+    local is_first_init = placeholder_state == "missing"
+    local local_json_path = paths.json
+
+    if is_first_init then
+        -- First-time setup requires user interaction; abort silently during auto-reconnect
+        if silent then return false end
+        if not confirm("No Link detected for current project: " .. _G.project:GetName() .. "\n\nInitialise link?") then
+            alert("User cancelled link initialisation. Aborting.")
+            return false
+        end
+
+        -- Create directories
+        for i, path in ipairs({paths.root, paths.support, paths.renders}) do
+            if not create_directory(path) then
+                return false
+            end
+        end
+
+        _G.json_path = local_json_path
+
+        get_motionbridge_folders()
+
+        if not create_placeholder_timeline() then
+            _G.json_path = nil
+            return false
+        end
+
+        if not initialise_json() then
+            _G.json_path = nil
+            return false
+        end
+
+        alert("MotionBridge Project initialised!\n Connect to same folder from AE using MotionBridge panel.")
+    else
+        -- Check if motionbridge folder exists in selected parent folder
+        if not directory_exists(paths.root) then
+            notify(silent, "No motionbridge folder found!")
+            return false
+        end
+
+        -- Validate directories exist
+        local checks = {
+            {paths.root, "MotionBridge folder not found at selected media path."},
+            {paths.support, "MotionBridge/Support folder missing."},
+            {paths.renders, "MotionBridge/Renders folder missing."}
+        }
+
+        for _, check in ipairs(checks) do
+            if not directory_exists(check[1]) then
+                notify(silent, check[2])
+                return false
+            end
+        end
+
+        if not file_exists(local_json_path) then
+            notify(silent, "motionbridge.json not found. Cannot rebind.")
+            return false
+        end
+
+        -- Temporarily set json_path so version_check/load_and_validate_json can read it.
+        -- Cleared on any failure below to avoid partial-state leak.
+        _G.json_path = local_json_path
+
+        if not version_check(silent) then
+            _G.json_path = nil
+            return false
+        end
+        if not silent then
+            alert("Link detected for current project: " .. _G.project:GetName() .. "\n\nRebinding...")
+        end
+
+        if not load_and_validate_json(silent) then
+            _G.json_path = nil
+            return false
+        end
+
+        get_motionbridge_folders()
+    end
+
+    if initial_timeline then
+        _G.project:SetCurrentTimeline(initial_timeline)
+    end
+
+    -- Commit globals only after all validation has passed
+    _G.project_media_path = project_media_path
+    _G.json_path = local_json_path
+    save_project_path(_G.project_id, project_media_path)
+    return true
 end
 
-function validate_placeholder()
+function validate_placeholder(silent)
     -- Returns: "missing", "valid", or false (error)
     local placeholder_timeline = get_mpi_by_name(_G.CONSTANTS.PLACEHOLDER_TL_NAME)
-    
+
     if not placeholder_timeline then
         return "missing"
     end
 
     local props = placeholder_timeline:GetClipProperty()
     local comment = props["Comments"] or ""
-    
+
     if comment == "" then
-        alert("Error: Comment with ID deleted from MotionBridge Placeholder.\n\nDelete timeline and re-initialise project")
+        notify(silent, "Error: Comment with ID deleted from MotionBridge Placeholder.\n\nDelete timeline and re-initialise project")
         return false
     end
 
     local pattern = _G.CONSTANTS.COMMENT_ID_PREFIX:gsub("([%(%)%-])", "%%%1") .. "%s*([%w%-]+)"
     local embedded_id = comment:match(pattern)
     if not embedded_id then
-        alert("Invalid MotionBridge placeholder comment format")
+        notify(silent, "Invalid MotionBridge placeholder comment format")
         return false
     end
 
     if embedded_id ~= _G.project:GetUniqueId() then
-        alert("MotionBridge placeholder belongs to a different project. Aborting.")
+        notify(silent, "MotionBridge placeholder belongs to a different project. Aborting.")
         return false
     end
 
@@ -484,20 +492,21 @@ function initialise_json()
     return save_json_data({
         projectid = _G.project_id,
         motionBridgeVersion = _G.CONSTANTS.MOTIONBRIDGE_VERSION,
+        schemaVersion = _G.CONSTANTS.SCHEMA_VERSION,
         projectFPS = _G.project:GetSetting("timelineFrameRate"),
         compositions = {}
     })
 end
 
-function load_and_validate_json()
+function load_and_validate_json(silent)
     local data = load_json_data(_G.json_path)
     if not data then
-        alert("Failed to read motionbridge.json.")
+        notify(silent, "Failed to read motionbridge.json.")
         return false
     end
 
     if data.projectid ~= _G.project_id then
-        alert("motionbridge folder belongs to a different project.")
+        notify(silent, "motionbridge folder belongs to a different project.")
         return false
     end
 
@@ -569,16 +578,19 @@ function is_video_file(filename)
 end
 
 -- GLOBAL REFRESHES
-function version_check()
+function version_check(silent)
     local data = load_json_data(_G.json_path)
-    local script_version = _G.CONSTANTS.MOTIONBRIDGE_VERSION
-    local saved_version = data.motionBridgeVersion
 
-    if saved_version ~= script_version then 
-        alert("Version mismatch detected.\n\nProject version: " .. saved_version .. "\nScript version: " .. script_version .. "\n\nPlease use MotionBridge v" .. saved_version .. " in both AE and Resolve for this project.") 
+    -- schemaVersion gates cross-script JSON compatibility. Pre-0.95 projects
+    -- have no schemaVersion field; treat them as schema 1.
+    local saved_schema = data.schemaVersion or 1
+    local script_schema = _G.CONSTANTS.SCHEMA_VERSION
+
+    if saved_schema ~= script_schema then
+        notify(silent, "MotionBridge schema mismatch detected.\n\nProject schema: v" .. saved_schema .. "\nScript schema: v" .. script_schema .. "\n\nThe project was created by an incompatible version of MotionBridge. Please align script versions in both AE and Resolve.")
         return false
     end
-    return true 
+    return true
 end
 
 function refresh_project_globals()
@@ -975,6 +987,16 @@ function alert(message)
         message = message,
         buttons = {"OK"}
     })
+end
+
+function notify(silent, message)
+    -- Dispatches to alert() for user-initiated actions, print() during silent auto-init
+    -- so startup reconnect failures don't fire modal dialogs.
+    if silent then
+        print("MotionBridge: " .. message)
+    else
+        alert(message)
+    end
 end
 
 function confirm(message)
@@ -2886,7 +2908,7 @@ do
     else
         print("MotionBridge: no saved project path found. Click 📂 to connect.")
     end
-    -- Always enable buttons — ensure_connected() handles the gate on each action
+    -- Always enable buttons — connect_to_project() handles the gate on each action
     set_ui_enabled(true)
 end
 
@@ -2897,24 +2919,17 @@ function MainWindow.On.Browse.Clicked(ev)
         return
     end
 
-    _G.project_media_path = chosenPath:gsub("\\", "/"):gsub("/+$", "")
-
-    local success = initialise(_G.project_media_path)
-    if not success then return end
-
-    update_project_fps()
-    refresh_project_globals()
-    ui_items.BrandingLabel.ToolTip = "Project folder: " .. _G.project_media_path
+    connect_to_folder(chosenPath)
 end
 
 function MainWindow.On.ImportNewComps.Clicked(ev)
-    if not ensure_connected() then return end
+    if not connect_to_project() then return end
     update_project_fps()
     import_new_comps()
 end 
 
 function MainWindow.On.InsertPlaceholderTimelineAtPlayhead.Clicked(ev)
-    if not ensure_connected() then return end
+    if not connect_to_project() then return end
     update_project_fps()
     local success = insert_placeholder_timeline_at_playhead()
     if not success then
@@ -2923,7 +2938,7 @@ function MainWindow.On.InsertPlaceholderTimelineAtPlayhead.Clicked(ev)
 end
 
 function MainWindow.On.NestLinkedInAEComp.Clicked(ev)
-    if not ensure_connected() then return end
+    if not connect_to_project() then return end
     update_project_fps()
 
     -- Validate placeholder is under the playhead before showing the dialog
@@ -2954,12 +2969,12 @@ function MainWindow.On.NestLinkedInAEComp.Clicked(ev)
 end
 
 function MainWindow.On.ImportMarkers.Clicked(ev)
-    if not ensure_connected() then return end
+    if not connect_to_project() then return end
     if not import_markers() then alert(get_context_help_message("markers")) end
 end
 
 function MainWindow.On.ExportMarkers.Clicked(ev)
-    if not ensure_connected() then return end
+    if not connect_to_project() then return end
     update_project_fps()
     if not export_markers() then 
         alert(get_context_help_message("markers"))
@@ -2969,7 +2984,7 @@ function MainWindow.On.ExportMarkers.Clicked(ev)
 end
 
 function MainWindow.On.RefreshRender.Clicked(ev)
-    if not ensure_connected() then return end
+    if not connect_to_project() then return end
     update_project_fps()
     local refreshed = refresh_render()
     if refreshed then 

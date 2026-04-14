@@ -6,7 +6,7 @@
 **An alternative to Adobe's Dynamic Link connecting DaVinci Resolve and After Effects**
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Version](https://img.shields.io/badge/version-0.9%20beta-orange.svg)](https://github.com/nathanstassin/MotionBridge)
+[![Version](https://img.shields.io/badge/version-0.95%20beta-orange.svg)](https://github.com/nathanstassin/MotionBridge)
 
 ---
 
