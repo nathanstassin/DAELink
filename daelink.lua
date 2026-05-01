@@ -2791,7 +2791,7 @@ local MainWindow = disp:AddWindow({
             ui:HGroup{
                 Weight = 0,
                 ui:Button{ ID = "ImportMarkers", Text = _G.CONSTANTS.ICONS.downTriangle .. " Import Markers", Weight = 0.5, ToolTip = "Pulls markers from the linked AE comp into this nest.\nUse after clicking " .. _G.CONSTANTS.ICONS.upTriangle .. " Export Markers in AE." },
-                ui:Button{ ID = "ExportMarkers", Text = _G.CONSTANTS.ICONS.upTriangle .. " Export Markers", Weight = 0.5, ToolTip = "Sends markers from this nest to the linked AE comp's DAELinkMarkers layer.\nApply in AE with " .. _G.CONSTANTS.ICONS.downTriangle .. " Import Markers." }
+                ui:Button{ ID = "ExportMarkers", Text = _G.CONSTANTS.ICONS.upTriangle .. " Export Markers", Weight = 0.5, ToolTip = "Sends markers from this nest to the linked AE comp as comp markers.\nApply in AE with " .. _G.CONSTANTS.ICONS.downTriangle .. " Import Markers." }
             }
         },
         ui:HGroup{

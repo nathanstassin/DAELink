@@ -51,9 +51,6 @@ function DAELink(thisObj) {
         },
         fileNames: {
             json: "daelink.json"
-        },
-        layerNames: {
-            markers: "DAELinkMarkers"
         }
     };
 
@@ -93,9 +90,9 @@ function DAELink(thisObj) {
         ],
         panelC : "Markers " + ICONS.upTriangle + " | " + ICONS.downTriangle,
         panelCbullets : [
-            "• " + ICONS.upTriangle + " Export Markers button sends markers from DAELinkMarkers layer to Davinci nest",
+            "• " + ICONS.upTriangle + " Export Markers button sends comp markers to the linked Davinci nest",
             "       " + ICONS.downRightArrow + " Click Import Markers button on Davinci side to update",
-            "• " + ICONS.downTriangle + " Import Markers button receives markers from Davinci, updating DAELinkMarkers layer",
+            "• " + ICONS.downTriangle + " Import Markers button receives markers from Davinci as comp markers on the active comp",
             "       " + ICONS.downRightArrow + " Imports markers set with Export Markers button on Davinci side"
         ],
         panelD : "Renders " + ICONS.plus + " | " + ICONS.play, 
@@ -137,8 +134,7 @@ function DAELink(thisObj) {
         }
     };
 
-    var markersLayerName = CONFIG.layerNames.markers;
-    var JSONfilePath;  
+    var JSONfilePath;
     var jsonFile;
     var linkedCompsFolder;
     var importedMediaFolder;
@@ -184,9 +180,9 @@ function DAELink(thisObj) {
         // Marker buttons
         var hGroup2 = createButtonGroup(activeCompPanel);
         var importMarkersBtn = hGroup2.add("button", undefined, ICONS.downTriangle + " Import Markers");
-        importMarkersBtn.helpTip = "Pulls markers from the linked DaVinci nest into the DAELinkMarkers layer.\nUse after clicking " + ICONS.upTriangle + " Export Markers in DaVinci.";
+        importMarkersBtn.helpTip = "Pulls markers from the linked DaVinci nest onto the active comp as comp markers.\nUse after clicking " + ICONS.upTriangle + " Export Markers in DaVinci.";
         var exportMarkersBtn = hGroup2.add("button", undefined, ICONS.upTriangle + " Export Markers");
-        exportMarkersBtn.helpTip = "Sends markers from the DAELinkMarkers layer to the linked DaVinci nest.\nApply in DaVinci with " + ICONS.downTriangle + " Import Markers.";
+        exportMarkersBtn.helpTip = "Sends the active comp's markers to the linked DaVinci nest.\nApply in DaVinci with " + ICONS.downTriangle + " Import Markers.";
 
         // Template + Add to Queue
         var hGroup3 = createButtonGroup(activeCompPanel);
@@ -806,7 +802,6 @@ function DAELink(thisObj) {
             compStartFrame: activeComp.displayStartFrame
         };
 
-        getOrCreateMarkersLayer(activeComp);
         activeComp.parentFolder = linkedCompsFolder;
 
         saveJSONData(data, "Linked active comp as " + newKey);
@@ -850,19 +845,19 @@ function DAELink(thisObj) {
                     compData.layers = null; 
                     saveJSONData(data);
 
-                    // Create markers from JSON data
-                    var markersLayer = getOrCreateMarkersLayer(currentComp);
+                    // Create markers from JSON data on the comp itself
                     var markers = compData.markers;
                     for (var i = 0; i < markers.length; i++) {
                         var m = markers[i];
                         var startTime = m.recordFrame / compData.fps;
                         var myMarker = new MarkerValue(m.name + "\n" + m.note);  // \n here for some reason \r only works one way
-                        myMarker.duration = m.duration / compData.fps;
+                        // Davinci has no 0-frame markers; its 1-frame markers are AE's 0-duration ones.
+                        myMarker.duration = m.duration <= 1 ? 0 : m.duration / compData.fps;
 
                         // Color label by index, not name (mismatch between AE and Davinci)
                         myMarker.label = m.color;
-                        markersLayer.property("Marker").setValueAtTime(startTime, myMarker);
-                    } 
+                        currentComp.markerProperty.setValueAtTime(startTime, myMarker);
+                    }
                     btnClickResult = true; 
                 } 
             }
@@ -1058,33 +1053,21 @@ function DAELink(thisObj) {
         return true; 
     }
 
-    function getOrCreateMarkersLayer(comp) {
-        for (var i = 1; i <= comp.numLayers; i++) {
-            if (comp.layer(i).name === markersLayerName || comp.layer(i).name === "MotionBridgeMarkers") {
-                return comp.layer(i);
-            }
-        }
-        var layer = comp.layers.addNull();
-        layer.name = markersLayerName;
-        layer.enabled = false;
-        return layer;
-    }
-
-    function getMarkersDataFromLayer(layer, fps) {
+    function getMarkersDataFromComp(comp, fps) {
         var markers = [];
-        var markerProp = layer.property("Marker");
-        
+        var markerProp = comp.markerProperty;
+
         if (!markerProp || !markerProp.numKeys) return markers;
-        
+
         for (var i = 1; i <= markerProp.numKeys; i++) {
             var keyTime = markerProp.keyTime(i);
             var markerValue = markerProp.keyValue(i);
             var comment = markerValue.comment || "";
-            
+
             // Properly handle AE's special line break character
             var lineBreakIndex = comment.search(/\r\n|\r|\n/);
             var name, note;
-            
+
             if (lineBreakIndex !== -1) {
                 name = comment.substring(0, lineBreakIndex);
                 note = comment.substring(lineBreakIndex + 1);
@@ -1092,7 +1075,7 @@ function DAELink(thisObj) {
                 name = comment;
                 note = "";
             }
-            
+
             // Handle markers starting before 0 (Doesn't exist in Davinci)
             var recordFrame = Math.round(keyTime * fps);
             var duration = Math.round(markerValue.duration * fps);
@@ -1117,23 +1100,24 @@ function DAELink(thisObj) {
         if (!data) return;
 
         var compData = data.compositions[findCompKeyByAeID(data, activeComp.id)];
-        var markersLayer = getOrCreateMarkersLayer(activeComp);
+        var markerProp = activeComp.markerProperty;
 
-        while (markersLayer.property("Marker").numKeys > 0) {
-            markersLayer.property("Marker").removeKey(1);
+        while (markerProp.numKeys > 0) {
+            markerProp.removeKey(1);
         }
 
         var markers = compData.markers;
         for (var i = 0; i < markers.length; i++) {
             var m = markers[i];
             var startTime = m.recordFrame / compData.fps;
-            var duration = m.duration / compData.fps;
-            
+            // Davinci has no 0-frame markers; its 1-frame markers are AE's 0-duration ones.
+            var duration = m.duration <= 1 ? 0 : m.duration / compData.fps;
+
             var myMarker = new MarkerValue(m.name + "\n" + m.note);  // \n here for some reason \r only works one way
             myMarker.duration = duration;
             myMarker.label = m.color;
-            
-            markersLayer.property("Marker").setValueAtTime(startTime, myMarker);
+
+            markerProp.setValueAtTime(startTime, myMarker);
         }
         alert((markers.length || 0) + " markers imported to " + activeComp.name);
     }
@@ -1142,13 +1126,7 @@ function DAELink(thisObj) {
         var data = loadJSONData();
         if (!data) return;
 
-        var markersLayer = getOrCreateMarkersLayer(activeComp);
-        if (!markersLayer) {
-            alert("No markers layer found!");
-            return;
-        }
-
-        var markers = getMarkersDataFromLayer(markersLayer, activeComp.frameRate);
+        var markers = getMarkersDataFromComp(activeComp, activeComp.frameRate);
 
         // Sanitise marker text
         for (var i = 0; i < markers.length; i++) {
