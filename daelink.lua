@@ -1,5 +1,5 @@
 --[[
-    MotionBridge | v0.95 Beta | © 2025-2026 Nathan Stassin
+    DAELink | v0.96 Beta | © 2025-2026 Nathan Stassin
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -30,8 +30,9 @@
                 No data is transmitted to external servers.
                 
     Version History:
-    - 0.9 Beta - 17/01/2026 
+    - 0.9 Beta - 17/01/2026
     - 0.95 Beta - 14/04/2026 - UI improvements
+    - 0.96 Beta - 23/04/2026 - Open AE Project button + live-link enforcement with AE side
 ]]
 
 -- GLOBALS
@@ -42,7 +43,7 @@ _G.media_pool = nil
 _G.root_folder = nil
 _G.project_media_path = nil 
 _G.json_path = nil 
-_G.motionbridge_folder = nil 
+_G.daelink_folder = nil 
 _G.comps_folder = nil 
 _G.renders_folder = nil 
 _G.compound_clips_folder = nil 
@@ -57,17 +58,17 @@ do
 end
 
 _G.CONSTANTS = {
-    MOTIONBRIDGE_VERSION = 0.95,
+    DAELINK_VERSION = 0.96,
     SCHEMA_VERSION = 1,
-    PLACEHOLDER_TL_NAME = "0_MotionBridgePlaceholder",
+    PLACEHOLDER_TL_NAME = "0_DAELinkPlaceholder",
     FOLDER_NAMES = {
-        MOTIONBRIDGE = "0_MotionBridge",
+        DAELINK = "0_DAELink",
         COMPOUNDCLIPS = "0_Compound Clips",
         RENDERS = "1_Renders", 
-        LINKEDCOMPS = "Linked Compositions"
+        LINKEDCOMPS = "Linked Nests"
     },
     DIRECTORY_NAMES = { 
-        ROOT = "motionbridge",
+        ROOT = "daelink",
         RENDERS = "renders",
         SUPPORT = "support"
     },
@@ -86,8 +87,8 @@ _G.CONSTANTS = {
         RENDER_AUDIO = "RENDER▪LOCKED",
         COMPOUND_CLIP = "COMPOUND CLIP"
     },
-    JSON_FILENAME = "motionbridge.json",
-    SETTINGS_FILENAME = "motionbridge_projects.json",
+    JSON_FILENAME = "daelink.json",
+    SETTINGS_FILENAME = "daelink_projects.json",
     COMMENT_ID_PREFIX = "ID(DONOTDELETE):",
     PRELINK_PATTERN = "^prelink%d+$",
     LINKED_CLIPS_SUFFIX = " linked clips",
@@ -126,7 +127,7 @@ _G.CONSTANTS = {
         plus           = "✚",
         play           = "▶"
     }, 
-    WEBSITEURL = "https://nathanstassin.com/motionbridge"
+    WEBSITEURL = "https://nathanstassin.com/daelink"
 }
 
 local TITLE_CSS = [[
@@ -165,15 +166,15 @@ function build_project_paths(base)
 end
 
 -- SETTINGS PERSISTENCE (per-project path memory)
--- Stored in motionbridge_projects.json alongside the script file.
+-- Stored in daelink_projects.json alongside the script file.
 -- Dict format: { [davinci_project_uuid] = "/path/to/media/folder", ... }
 function get_settings_path()
     if _G.SCRIPT_DIR and _G.SCRIPT_DIR ~= "" then
         local path = _G.SCRIPT_DIR .. "/" .. _G.CONSTANTS.SETTINGS_FILENAME
-        print("MotionBridge: settings file → " .. path)
+        print("DAELink: settings file → " .. path)
         return path
     end
-    print("MotionBridge: WARNING — could not determine script directory for settings file.")
+    print("DAELink: WARNING — could not determine script directory for settings file.")
     return _G.CONSTANTS.SETTINGS_FILENAME
 end
 
@@ -204,6 +205,11 @@ end
 function load_project_settings()
     local path = get_settings_path()
     local f = io.open(path, "r")
+    if not f then
+        -- Fallback: read legacy motionbridge_projects.json until v1 release
+        local legacy_path = _G.SCRIPT_DIR and (_G.SCRIPT_DIR .. "/motionbridge_projects.json") or "motionbridge_projects.json"
+        f = io.open(legacy_path, "r")
+    end
     if not f then return {} end
     local content = f:read("*a")
     f:close()
@@ -238,10 +244,11 @@ function try_auto_initialise()
     local saved_path = load_project_path(_G.project_id)
     if not saved_path or saved_path == "" then return nil end
 
-    -- Validate the saved path still has a motionbridge folder
+    -- Validate the saved path still has a daelink or legacy motionbridge folder
     local paths = build_project_paths(saved_path)
-    if not file_exists(paths.json) then
-        print("MotionBridge: saved path no longer valid — " .. saved_path)
+    local legacy_json = saved_path .. "/motionbridge/" .. _G.CONSTANTS.DIRECTORY_NAMES.SUPPORT .. "/motionbridge.json"
+    if not file_exists(paths.json) and not file_exists(legacy_json) then
+        print("DAELink: saved path no longer valid — " .. saved_path)
         return nil
     end
 
@@ -260,7 +267,7 @@ function connect_to_folder(chosen_path, silent)
     local success = initialise(normalised, silent)
     if success then
         update_project_fps()
-        ui_items.BrandingLabel.ToolTip = "Project folder: " .. _G.project_media_path
+        ui_items.BrandingName.ToolTip = "Project folder: " .. _G.project_media_path
     end
     return success
 end
@@ -303,12 +310,12 @@ function connect_to_project()
             -- Init failed despite valid path (e.g. version mismatch) — fall through to picker
         else
             -- Case 2: Path saved but folder has moved — notify, then fall through to picker
-            alert("MotionBridge project folder not found at:\n" .. saved_path .. "\n\nPlease navigate to its new location.")
+            alert("DAELink project folder not found at:\n" .. saved_path .. "\n\nPlease navigate to its new location.")
         end
     end
 
     -- Case 2 (folder moved) or Case 3 (no saved path) — open picker
-    local chosen_path = fu:RequestDir("Select this project's motionbridge media folder...")
+    local chosen_path = fu:RequestDir("Select this project's daelink media folder...")
     return connect_to_folder(chosen_path)
 end
 
@@ -328,9 +335,9 @@ function initialise(project_media_path, silent)
     local normalised_path = project_media_path
     local lower_path = normalised_path:lower()
 
-    if lower_path:match("/motionbridge/?$") then
-        -- User selected motionbridge folder, strip it off to get parent
-        project_media_path = normalised_path:match("^(.*)/[mM][oO][tT][iI][oO][nN][bB][rR][iI][dD][gG][eE]/?$")
+    if lower_path:match("/daelink/?$") or lower_path:match("/motionbridge/?$") then
+        -- User selected project root folder, strip it off to get parent
+        project_media_path = normalised_path:match("^(.*)/[^/]+/?$") or normalised_path
     end
 
     local paths = build_project_paths(project_media_path)
@@ -365,7 +372,7 @@ function initialise(project_media_path, silent)
 
         _G.json_path = local_json_path
 
-        get_motionbridge_folders()
+        get_daelink_folders()
 
         if not create_placeholder_timeline() then
             _G.json_path = nil
@@ -377,19 +384,26 @@ function initialise(project_media_path, silent)
             return false
         end
 
-        alert("MotionBridge Project initialised!\n Connect to same folder from AE using MotionBridge panel.")
+        alert("DAELink Project initialised!\n Connect to same folder from AE using DAELink panel.")
     else
-        -- Check if motionbridge folder exists in selected parent folder
+        -- Accept legacy "motionbridge/" folder structure until v1 release
         if not directory_exists(paths.root) then
-            notify(silent, "No motionbridge folder found!")
-            return false
+            local legacy_root = project_media_path .. "/motionbridge"
+            if directory_exists(legacy_root) then
+                local legacy_support = legacy_root .. "/" .. _G.CONSTANTS.DIRECTORY_NAMES.SUPPORT
+                paths = { root = legacy_root, support = legacy_support, renders = legacy_root .. "/" .. _G.CONSTANTS.DIRECTORY_NAMES.RENDERS, json = legacy_support .. "/motionbridge.json" }
+                local_json_path = paths.json
+            else
+                notify(silent, "No daelink or motionbridge folder found!")
+                return false
+            end
         end
 
         -- Validate directories exist
         local checks = {
-            {paths.root, "MotionBridge folder not found at selected media path."},
-            {paths.support, "MotionBridge/Support folder missing."},
-            {paths.renders, "MotionBridge/Renders folder missing."}
+            {paths.root, "Project folder not found at selected media path."},
+            {paths.support, "Project/Support folder missing."},
+            {paths.renders, "Project/Renders folder missing."}
         }
 
         for _, check in ipairs(checks) do
@@ -399,9 +413,15 @@ function initialise(project_media_path, silent)
             end
         end
 
+        -- Accept legacy motionbridge.json filename until v1 release
         if not file_exists(local_json_path) then
-            notify(silent, "motionbridge.json not found. Cannot rebind.")
-            return false
+            local legacy_json = paths.root .. "/" .. _G.CONSTANTS.DIRECTORY_NAMES.SUPPORT .. "/motionbridge.json"
+            if file_exists(legacy_json) then
+                local_json_path = legacy_json
+            else
+                notify(silent, "daelink.json not found. Cannot rebind.")
+                return false
+            end
         end
 
         -- Temporarily set json_path so version_check/load_and_validate_json can read it.
@@ -421,7 +441,7 @@ function initialise(project_media_path, silent)
             return false
         end
 
-        get_motionbridge_folders()
+        get_daelink_folders()
     end
 
     if initial_timeline then
@@ -438,6 +458,7 @@ end
 function validate_placeholder(silent)
     -- Returns: "missing", "valid", or false (error)
     local placeholder_timeline = get_mpi_by_name(_G.CONSTANTS.PLACEHOLDER_TL_NAME)
+        or get_mpi_by_name("0_MotionBridgePlaceholder")
 
     if not placeholder_timeline then
         return "missing"
@@ -447,19 +468,19 @@ function validate_placeholder(silent)
     local comment = props["Comments"] or ""
 
     if comment == "" then
-        notify(silent, "Error: Comment with ID deleted from MotionBridge Placeholder.\n\nDelete timeline and re-initialise project")
+        notify(silent, "Error: Comment with ID deleted from DAELink Placeholder.\n\nDelete timeline and re-initialise project")
         return false
     end
 
     local pattern = _G.CONSTANTS.COMMENT_ID_PREFIX:gsub("([%(%)%-])", "%%%1") .. "%s*([%w%-]+)"
     local embedded_id = comment:match(pattern)
     if not embedded_id then
-        notify(silent, "Invalid MotionBridge placeholder comment format")
+        notify(silent, "Invalid DAELink placeholder comment format")
         return false
     end
 
     if embedded_id ~= _G.project:GetUniqueId() then
-        notify(silent, "MotionBridge placeholder belongs to a different project. Aborting.")
+        notify(silent, "DAELink placeholder belongs to a different project. Aborting.")
         return false
     end
 
@@ -467,11 +488,11 @@ function validate_placeholder(silent)
 end
 
 function create_placeholder_timeline()
-    _G.media_pool:SetCurrentFolder(_G.motionbridge_folder)
+    _G.media_pool:SetCurrentFolder(_G.daelink_folder)
 
     local tl = _G.media_pool:CreateEmptyTimeline(_G.CONSTANTS.PLACEHOLDER_TL_NAME)
     if not tl then
-        alert("Failed to create MotionBridge placeholder timeline.")
+        alert("Failed to create DAELink placeholder timeline.")
         return false
     end
 
@@ -491,7 +512,7 @@ end
 function initialise_json()
     return save_json_data({
         projectid = _G.project_id,
-        motionBridgeVersion = _G.CONSTANTS.MOTIONBRIDGE_VERSION,
+        daelinkVersion = _G.CONSTANTS.DAELINK_VERSION,
         schemaVersion = _G.CONSTANTS.SCHEMA_VERSION,
         projectFPS = _G.project:GetSetting("timelineFrameRate"),
         compositions = {}
@@ -501,12 +522,12 @@ end
 function load_and_validate_json(silent)
     local data = load_json_data(_G.json_path)
     if not data then
-        notify(silent, "Failed to read motionbridge.json.")
+        notify(silent, "Failed to read daelink.json.")
         return false
     end
 
     if data.projectid ~= _G.project_id then
-        notify(silent, "motionbridge folder belongs to a different project.")
+        notify(silent, "daelink folder belongs to a different project.")
         return false
     end
 
@@ -587,7 +608,7 @@ function version_check(silent)
     local script_schema = _G.CONSTANTS.SCHEMA_VERSION
 
     if saved_schema ~= script_schema then
-        notify(silent, "MotionBridge schema mismatch detected.\n\nProject schema: v" .. saved_schema .. "\nScript schema: v" .. script_schema .. "\n\nThe project was created by an incompatible version of MotionBridge. Please align script versions in both AE and Resolve.")
+        notify(silent, "DAELink schema mismatch detected.\n\nProject schema: v" .. saved_schema .. "\nScript schema: v" .. script_schema .. "\n\nThe project was created by an incompatible version of DAELink. Please align script versions in both AE and Resolve.")
         return false
     end
     return true
@@ -615,9 +636,23 @@ function update_project_fps()
     save_json_data(data)
 end
 
-function get_motionbridge_folders()
-    _G.motionbridge_folder = get_or_create_folder(_G.root_folder, _G.CONSTANTS.FOLDER_NAMES.MOTIONBRIDGE)
-    _G.comps_folder = get_or_create_folder(_G.motionbridge_folder, _G.CONSTANTS.FOLDER_NAMES.LINKEDCOMPS)
+function get_daelink_folders()
+    -- Detect-and-use legacy "0_MotionBridge" media pool folder until v1 release
+    _G.daelink_folder = nil
+    for _, bin in ipairs(_G.root_folder:GetSubFolderList()) do
+        if bin:GetName() == "0_MotionBridge" then _G.daelink_folder = bin; break end
+    end
+    if not _G.daelink_folder then
+        _G.daelink_folder = get_or_create_folder(_G.root_folder, _G.CONSTANTS.FOLDER_NAMES.DAELINK)
+    end
+    -- MediaPoolFolder has no SetName() — detect legacy folder and keep using it; new projects get "Linked Nests"
+    _G.comps_folder = nil
+    for _, bin in ipairs(_G.daelink_folder:GetSubFolderList()) do
+        if bin:GetName() == "Linked Compositions" then _G.comps_folder = bin; break end
+    end
+    if not _G.comps_folder then
+        _G.comps_folder = get_or_create_folder(_G.daelink_folder, _G.CONSTANTS.FOLDER_NAMES.LINKEDCOMPS)
+    end
     _G.renders_folder = get_or_create_folder(_G.comps_folder, _G.CONSTANTS.FOLDER_NAMES.RENDERS)
     _G.compound_clips_folder = get_or_create_folder(_G.comps_folder, _G.CONSTANTS.FOLDER_NAMES.COMPOUNDCLIPS)
 end 
@@ -993,7 +1028,7 @@ function notify(silent, message)
     -- Dispatches to alert() for user-initiated actions, print() during silent auto-init
     -- so startup reconnect failures don't fire modal dialogs.
     if silent then
-        print("MotionBridge: " .. message)
+        print("DAELink: " .. message)
     else
         alert(message)
     end
@@ -1111,143 +1146,6 @@ function prompt_new_comp_dialog()
     disp:RunLoop()
     win:Hide()
     return result
-end
-
-function show_help_window()
-    if not _G.disp then
-        print("[HELP] Help dialog not available")
-        return
-    end
-    local BUTTON_COLOR_CSS = "QLabel { color: rgba(221, 251, 225, 1); }"
-    local helpWin = _G.disp:AddWindow({
-        ID = "HelpDialog",
-        WindowTitle = "How MotionBridge Works",
-        Geometry = {300, 500, 500, 600},
-        ui:VGroup{
-            FixedSize = { 500, 560 },
-            ID = "root",
-            Weight = 0, 
-
-            ui:VGroup{
-                Weight = 0,
-                ui:Label{ Text = "Getting Started", StyleSheet = TITLE_CSS, Alignment = {AlignCenter = true} },
-                ui:HGroup{
-                    Spacing = 5,
-                    ui:Label{ Text = "•", Weight = 0 },
-                    ui:Label{ Text = _G.CONSTANTS.ICONS.openFolder .. " Browse", Weight = 0, StyleSheet = BUTTON_COLOR_CSS },
-                    ui:Label{ Text = "to initialise/connect to current project motionbridge folder.", Weight = 1, WordWrap = true }
-                },
-                ui:Label{
-                    Text = "• Then connect AE Project by navigating to motionbridge folder from there.\n" ..
-                           "• Each project has its own motionbridge folder, with subfolders:\n" ..
-                           "       " .. _G.CONSTANTS.ICONS.downRightArrow .. " Renders: all renders from AE\n" ..
-                           "       " .. _G.CONSTANTS.ICONS.downRightArrow .. " Support: JSON file which contains link data",
-                    WordWrap = true,
-                    Alignment = {AlignLeft = true, AlignTop = true}
-                },
-                ui:Label{ FrameStyle = 4, Weight = 0 }
-            },
-            
-            ui:VGroup{
-                Weight = 0,
-                ui:Label{ Text = "Linking Compositions with After Effects " .. _G.CONSTANTS.ICONS.upArrow .. " | " .. _G.CONSTANTS.ICONS.downArrow, StyleSheet = TITLE_CSS, Alignment = {AlignCenter = true} },
-                ui:HGroup{
-                    Spacing = 5,
-                    ui:Label{ Text = "•", Weight = 0 },
-                    ui:Label{ Text = _G.CONSTANTS.ICONS.downArrow .. " Import Linked Comps", Weight = 0, StyleSheet = BUTTON_COLOR_CSS },
-                    ui:Label{ Text = "button retrieves new compositions from AE", Weight = 1, WordWrap = true }
-                },
-                ui:HGroup{
-                    Spacing = 5,
-                    ui:Label{ Text = "       " .. _G.CONSTANTS.ICONS.downRightArrow .. " Click", Weight = 0 },
-                    ui:Label{ Text = _G.CONSTANTS.ICONS.upArrow .. " Link Active Comp", Weight = 0, StyleSheet = BUTTON_COLOR_CSS },
-                    ui:Label{ Text = "button on AE side to establish the link", Weight = 1, WordWrap = true }
-                },
-                ui:HGroup{
-                    Spacing = 5,
-                    ui:Label{ Text = "•", Weight = 0 },
-                    ui:Label{ Text = _G.CONSTANTS.ICONS.upArrow .. " Replace Linked Layers With Nested AE Comp", Weight = 0, StyleSheet = BUTTON_COLOR_CSS },
-                    ui:Label{ Text = "to send to AE", Weight = 1, WordWrap = true }
-                },
-                ui:HGroup{
-                    Spacing = 5,
-                    ui:Label{ Text = "       " .. _G.CONSTANTS.ICONS.downRightArrow .. " Click", Weight = 0 },
-                    ui:Label{ Text = _G.CONSTANTS.ICONS.downArrow .. " Import Linked Comps", Weight = 0, StyleSheet = BUTTON_COLOR_CSS },
-                    ui:Label{ Text = "on AE side to finalise the link", Weight = 1, WordWrap = true }
-                },
-                ui:Label{ FrameStyle = 4, Weight = 0 }
-            },
-            
-            ui:VGroup{
-                Weight = 0,
-                ui:Label{ Text = "Markers " .. _G.CONSTANTS.ICONS.upTriangle .. " | " .. _G.CONSTANTS.ICONS.downTriangle, StyleSheet = TITLE_CSS, Alignment = {AlignCenter = true} },
-                ui:HGroup{
-                    Spacing = 5,
-                    ui:Label{ Text = "•", Weight = 0 },
-                    ui:Label{ Text = _G.CONSTANTS.ICONS.upTriangle .. " Export Markers", Weight = 0, StyleSheet = BUTTON_COLOR_CSS },
-                    ui:Label{ Text = "button sends markers from timeline to AE comp", Weight = 1, WordWrap = true }
-                },
-                ui:HGroup{
-                    Spacing = 5,
-                    ui:Label{ Text = "       " .. _G.CONSTANTS.ICONS.downRightArrow .. " Click", Weight = 0 },
-                    ui:Label{ Text = _G.CONSTANTS.ICONS.downTriangle .. " Import Markers", Weight = 0, StyleSheet = BUTTON_COLOR_CSS },
-                    ui:Label{ Text = "button on AE side to update", Weight = 1, WordWrap = true }
-                },
-                ui:HGroup{
-                    Spacing = 5,
-                    ui:Label{ Text = "•", Weight = 0 },
-                    ui:Label{ Text = _G.CONSTANTS.ICONS.downTriangle .. " Import Markers", Weight = 0, StyleSheet = BUTTON_COLOR_CSS },
-                    ui:Label{ Text = "button receives markers from AE", Weight = 1, WordWrap = true }
-                },
-                ui:HGroup{
-                    Spacing = 5,
-                    ui:Label{ Text = "       " .. _G.CONSTANTS.ICONS.downRightArrow .. " Click", Weight = 0 },
-                    ui:Label{ Text = _G.CONSTANTS.ICONS.upTriangle .. " Export Markers", Weight = 0, StyleSheet = BUTTON_COLOR_CSS },
-                    ui:Label{ Text = "button on AE side to send from MotionBridgeMarkers", Weight = 1, WordWrap = true }
-                },
-                ui:Label{ FrameStyle = 4, Weight = 0 }
-            },
-            
-            ui:VGroup{
-                Weight = 0,
-                ui:Label{ Text = "Renders " .. _G.CONSTANTS.ICONS.refresh, StyleSheet = TITLE_CSS, Alignment = {AlignCenter = true} },
-                ui:HGroup{
-                    Spacing = 5,
-                    ui:Label{ Text = "•", Weight = 0 },
-                    ui:Label{ Text = _G.CONSTANTS.ICONS.refresh .. " Refresh Render", Weight = 0, StyleSheet = BUTTON_COLOR_CSS },
-                    ui:Label{ Text = "button updates timeline nest with latest AE render", Weight = 1, WordWrap = true }
-                },
-                ui:HGroup{
-                    Spacing = 5,
-                    ui:Label{ Text = "       " .. _G.CONSTANTS.ICONS.downRightArrow .. " Click", Weight = 0 },
-                    ui:Label{ Text = _G.CONSTANTS.ICONS.plus .. " Queue", Weight = 0, StyleSheet = BUTTON_COLOR_CSS },
-                    ui:Label{ Text = "or", Weight = 0 },
-                    ui:Label{ Text = _G.CONSTANTS.ICONS.play .. " Render", Weight = 0, StyleSheet = BUTTON_COLOR_CSS },
-                    ui:Label{ Text = "buttons on AE side to generate new renders", Weight = 1, WordWrap = true }
-                },
-                ui:Label{
-                    Text = "       " .. _G.CONSTANTS.ICONS.downRightArrow .. " Renders appear in '.../media/motionbridge/renders' folder",
-                    WordWrap = true,
-                    Alignment = {AlignLeft = true, AlignTop = true}
-                }
-            },
-            ui:Label{ FrameStyle = 4, Weight = 0 },
-            ui:Button{ ID = "LearnMore", Text = "Learn More", Weight = 0 }
-        }
-    })
-    
-    helpWin.On.LearnMore.Clicked = function()
-        bmd.openurl(_G.CONSTANTS.WEBSITEURL)
-    end
-    
-    helpWin.On.HelpDialog.Close = function()
-        _G.disp:ExitLoop()
-    end
-    
-    helpWin:RecalcLayout()
-    helpWin:Show()
-    _G.disp:RunLoop()
-    helpWin:Hide()
 end
 
 function show_paginated_selection_dialog(config)
@@ -1888,7 +1786,7 @@ function insert_placeholder_timeline_at_playhead()
 
     local placeholder_timeline = get_mpi_by_name(_G.CONSTANTS.PLACEHOLDER_TL_NAME)
     if not placeholder_timeline then
-        print("Error: 'MotionBridgePlaceholder' not found in Media Pool.")
+        print("Error: 'DAELinkPlaceholder' not found in Media Pool.")
         return
     end
 
@@ -1995,7 +1893,7 @@ end
 
 function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_settings)
     if not require_initialisation() then return end
-    get_motionbridge_folders()
+    get_daelink_folders()
     local placeholder_timeline = get_mpi_by_name(_G.CONSTANTS.PLACEHOLDER_TL_NAME)
     if not comp_name or comp_name:match("^%s*$") then
         alert("Please enter a valid composition name.")
@@ -2005,7 +1903,7 @@ function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_setti
     local placeholder = base_timeline:GetCurrentVideoItem()
 
     if not placeholder or placeholder:GetName() ~= placeholder_timeline:GetName() then
-        alert("Error: No MotionBridgePlaceholder in top active video layer.")
+        alert("Error: No DAELinkPlaceholder in top active video layer.")
         return
     end
 
@@ -2446,7 +2344,7 @@ function refresh_render_in_timeline(timeline, comp_data)
         return false
     end
 
-    set_a1_v1_tracks_locked(timeline, false) 
+    set_a1_v1_tracks_locked(timeline, false)
 
     local v1_items = timeline:GetItemsInTrack("video", 1)
     if v1_items then for _, item in pairs(v1_items) do timeline:DeleteClips({item}) end end
@@ -2458,11 +2356,12 @@ function refresh_render_in_timeline(timeline, comp_data)
     local appended_video = _G.media_pool:AppendToTimeline({video_clip_data})
     local appended_audio = _G.media_pool:AppendToTimeline({audio_clip_data})
 
-    set_a1_v1_tracks_locked(timeline, true) 
+    set_a1_v1_tracks_locked(timeline, true)
 
     if appended_video and #appended_video > 0 then
         timeline:SetTrackEnable("video", 2, false) -- Hide compound clip
-        timeline:SetTrackEnable("audio", 1, false) -- Mute render audio by default
+        local render_has_audio = appended_audio and #appended_audio > 0
+        timeline:SetTrackEnable("audio", 1, render_has_audio) -- Unmute A1 only when render carries audio
         print("Imported render: " .. render_path)
         _G.media_pool:SetCurrentFolder(initial_folder)
         return true
@@ -2683,7 +2582,7 @@ end
 function remove_orphaned_render_mpis()
     -- Extra cleanup: remove unused (0-usage) media pool items in the Renders bin
     -- In case render file was overwitten with different duration - this causes an orphaned reference for the old longer render
-    get_motionbridge_folders()
+    get_daelink_folders()
 
     if _G.renders_folder then
         local clips = _G.renders_folder:GetClipList()
@@ -2818,64 +2717,105 @@ function generate_proxy()
 end
 ]]
 
+-- OPEN AE PROJECT
+-- Reads aeProjectPath from daelink.json (written by the JSX side on every successful
+-- connection). Three outcomes:
+--   1. JSON missing / aeProjectPath empty → launch AE.app (Mac only; Windows shows a message)
+--   2. Path present, file exists         → launch that .aep/.aet
+--   3. Path present, file missing        → alert the user; on Mac also launch AE.app
+function open_ae_project()
+    local separator = package.config:sub(1,1)
+    local is_windows = separator == '\\'
+
+    local ae_path = nil
+    if _G.json_path and file_exists(_G.json_path) then
+        local data = load_json_data(_G.json_path)
+        if data then ae_path = data.aeProjectPath end
+    end
+
+    if not ae_path or ae_path == "" then
+        if is_windows then
+            alert("No linked After Effects project yet.\n\nOpen After Effects and connect this DaVinci project from the DAELink panel.")
+        else
+            os.execute('open -a "Adobe After Effects"')
+        end
+        return
+    end
+
+    if not file_exists(ae_path) then
+        alert("Linked AE project not found at:\n" .. ae_path .. "\n\nThe file may have been moved or renamed.\n\nOpen After Effects and connect from the DAELink panel to re-link.")
+        if not is_windows then
+            os.execute('open -a "Adobe After Effects"')
+        end
+        return
+    end
+
+    if is_windows then
+        local native_path = ae_path:gsub("/", "\\")
+        os.execute('cmd /c start "" "' .. native_path .. '"')
+    else
+        os.execute('open "' .. ae_path .. '"')
+    end
+end
+
 -- GUI LAYOUT
 _G.ui = fu.UIManager
 _G.disp = bmd.UIDispatcher(ui)
+local DIVIDER_CSS = "QLabel { background-color: rgba(90, 90, 90, 255); margin: 0; padding: 0; border: 0; }"
+
 local MainWindow = disp:AddWindow({
     ID = "MainWind",
-    WindowTitle = "MotionBridge",
-    Geometry = { 950, 400, 290, 270 },
+    WindowTitle = "DAELink",
+    Geometry = { 950, 400, 330, 210 },
 
     ui:VGroup{
         ID = "root",
-        Spacing = 10,
+        Spacing = 6,
         Weight = 0,
-        MaximumSize = { 950, 300 }, 
-        ui:VGroup{
-            ID = "LinkCompositionsPanel",
-            ToolTip = "Import compositions linked from AE, or create a new linked nest from a placeholder clip.",
+        FixedSize = { 320, 182 },
+        ContentsMargins = { 0, 0, 0, 0 },
+        ui:HGroup{
             Weight = 0,
-            Spacing = 5,
-            ui:Label{ Text = "Link Compositions", Alignment = {AlignCenter = true}, Weight = 0, StyleSheet = TITLE_CSS },
-            ui:HGroup{
-                Weight = 0,
-                ui:Button{ ID = "ImportNewComps", Text = _G.CONSTANTS.ICONS.downArrow .. " Import Linked Comps", Weight = 0.5 },
-                ui:Button{ ID = "InsertPlaceholderTimelineAtPlayhead", Text = _G.CONSTANTS.ICONS.downToBarArrow .. " Insert Placeholder", Weight = 0.5 }
-            },
-            ui:HGroup{
-                Weight = 0,
-                ui:Button{ ID = "NestLinkedInAEComp", Text = _G.CONSTANTS.ICONS.upArrow .. " Replace Linked Layers With Nested AE Comp", Weight = 1 }          
-            },
-            ui:Label{ FrameStyle = 4, Weight = 0 }
+            ui:Button{ ID = "ImportNewComps", Text = _G.CONSTANTS.ICONS.downArrow .. " Import Linked Comps", Weight = 0.5, ToolTip = "Imports compositions pre-linked from AE (via " .. _G.CONSTANTS.ICONS.upArrow .. " Link Active Comp) as new linked nests in this project." },
+            ui:Button{ ID = "InsertPlaceholderTimelineAtPlayhead", Text = _G.CONSTANTS.ICONS.downToBarArrow .. " Insert Placeholder", Weight = 0.5, ToolTip = "Drops a placeholder clip at the playhead - the starting point for creating a new AE comp from DaVinci.\nOptionally link other clips to it (Resolve's Link Clips) to bundle them into the new comp." }
+        },
+        ui:HGroup{
+            Weight = 0,
+            ui:Button{ ID = "NestLinkedInAEComp", Text = _G.CONSTANTS.ICONS.upArrow .. " Make AE Comp From Placeholder", Weight = 1, ToolTip = "Converts the placeholder under the playhead into a nested timeline.\nCreate linked comp in AE by clicking " .. _G.CONSTANTS.ICONS.downArrow .. " Import Linked Comps." }
         },
         ui:VGroup{
-            ID = "LinkedNestPanel",
-            ToolTip = "Bring playhead over a nest clip, or open the nested timeline.\nUse markers to share timing notes with AE.\nRefresh Render updates the nest with the latest AE render.",  
             Weight = 0,
-            Spacing = 5,
-            ui:Label{ Text = "Linked Nest", Alignment = {AlignCenter = true}, Weight = 0, StyleSheet = TITLE_CSS },
+            Spacing = 0,
+            ContentsMargins = { 0, 0, 0, 0 },
+            ui:Label{ Text = "", Weight = 0, MinimumSize = {0, 1}, MaximumSize = {10000, 1}, StyleSheet = DIVIDER_CSS },
             ui:HGroup{
                 Weight = 0,
-                ui:Button{ ID = "ImportMarkers", Text = _G.CONSTANTS.ICONS.downTriangle .. " Import Markers", Weight = 0.5 },
-                ui:Button{ ID = "ExportMarkers", Text = _G.CONSTANTS.ICONS.upTriangle .. " Export Markers", Weight = 0.5 }
-            },
-            ui:HGroup{
-                Weight = 0,
-                ui:Button{ ID = "RefreshRender", Text = _G.CONSTANTS.ICONS.refresh .. " Refresh Render", Weight = 0.5 }
-                -- ui:Button{ ID = "GenerateProxy", Text = "▶ Generate Proxy", Weight = 0.5 }
-            },
-            ui:Label{ FrameStyle = 4, Weight = 0 }
-        }, 
+                ui:Button{ ID = "ImportMarkers", Text = _G.CONSTANTS.ICONS.downTriangle .. " Import Markers", Weight = 0.5, ToolTip = "Pulls markers from the linked AE comp into this nest.\nUse after clicking " .. _G.CONSTANTS.ICONS.upTriangle .. " Export Markers in AE." },
+                ui:Button{ ID = "ExportMarkers", Text = _G.CONSTANTS.ICONS.upTriangle .. " Export Markers", Weight = 0.5, ToolTip = "Sends markers from this nest to the linked AE comp's DAELinkMarkers layer.\nApply in AE with " .. _G.CONSTANTS.ICONS.downTriangle .. " Import Markers." }
+            }
+        },
+        ui:HGroup{
+            Weight = 0,
+            ui:Button{ ID = "RefreshRender", Text = _G.CONSTANTS.ICONS.refresh .. " Refresh Render", Weight = 0.5, ToolTip = "Updates this nest's video/audio with the latest render from the linked AE comp's renders folder." }
+            -- ui:Button{ ID = "GenerateProxy", Text = "▶ Generate Proxy", Weight = 0.5 }
+        },
         ui:VGroup{
-            ID = "BrandingPanel",
             Weight = 0,
-            Spacing = 5,
+            Spacing = 0,
+            ContentsMargins = { 0, 0, 0, 0 },
+            ui:Label{ Text = "", Weight = 0, MinimumSize = {0, 1}, MaximumSize = {10000, 1}, StyleSheet = DIVIDER_CSS },
             ui:HGroup{
-                Spacing = 5,
-                ui:TextEdit{ ID = "Logo", HTML = "<a href='" .. _G.CONSTANTS.WEBSITEURL .. "'><img src='".._G.CONSTANTS.ICONS.logoB64 .."' width='20' height='20' style='vertical-align:middle;'>", ReadOnly = true, FrameStyle = 0, FixedSize = {30, 30}, Events = { AnchorClicked = true }, Weight = 0},
-                ui:Label{ ID = "BrandingLabel", Text = "MotionBridge v" .. _G.CONSTANTS.MOTIONBRIDGE_VERSION .. " | " .. _G.CONSTANTS.ICONS.copyright .. " 2026 Nathan Stassin ", Alignment = {AlignVCenter = true}, Weight = 0.8, StyleSheet = BRANDING_CSS},
-                ui:Button{ ID = "Browse", Text = _G.CONSTANTS.ICONS.openFolder, Weight = 0, MinimumSize = {30, 30}, MaximumSize = {30, 30}, ToolTip = "Change project media folder" },
-                ui:Button{ ID = "Help", Text = _G.CONSTANTS.ICONS.help, Weight = 0, MinimumSize = {30, 30}, MaximumSize = {30, 30}, StyleSheet = BRANDING_CSS }
+            Spacing = 5,
+            ui:TextEdit{ ID = "Logo", HTML = "<a href='" .. _G.CONSTANTS.WEBSITEURL .. "'><img src='".._G.CONSTANTS.ICONS.logoB64 .."' width='20' height='20' style='vertical-align:middle;'>", ReadOnly = true, FrameStyle = 0, FixedSize = {30, 30}, Events = { AnchorClicked = true }, Weight = 0},
+            ui:Label{
+                ID = "BrandingName",
+                Text = "<span style='color:rgb(200,200,200); font-size:11px;'>DAELink v" .. _G.CONSTANTS.DAELINK_VERSION .. "</span><br>" ..
+                       "<span style='color:rgb(150,150,150); font-size:8px;'>" .. _G.CONSTANTS.ICONS.copyright .. " 2026 Nathan Stassin</span>",
+                Alignment = { AlignLeft = true, AlignVCenter = true },
+                Weight = 0.8
+            },
+            ui:Button{ ID = "Browse", Text = _G.CONSTANTS.ICONS.openFolder, Weight = 0, MinimumSize = {30, 30}, MaximumSize = {30, 30}, ToolTip = "Re-select this project's daelink folder.\nUse if the folder has moved or you need to re-link." },
+            ui:Button{ ID = "OpenAE", Text = "AE", Weight = 0, MinimumSize = {30, 30}, MaximumSize = {30, 30}, ToolTip = "Opens the linked After Effects project.\nLaunches AE if no project is linked yet." }
             }
         }
     }
@@ -2897,6 +2837,7 @@ function set_ui_enabled(bool)
     ui_items.ImportMarkers.Enabled = bool
     ui_items.ExportMarkers.Enabled = bool
     ui_items.RefreshRender.Enabled = bool
+    ui_items.OpenAE.Enabled = bool
     -- ui_items.GenerateProxy.Enabled = bool
 end
 
@@ -2904,16 +2845,16 @@ end
 do
     local restored_path = try_auto_initialise()
     if restored_path then
-        ui_items.BrandingLabel.ToolTip = "Project folder: " .. restored_path
+        ui_items.BrandingName.ToolTip = "Project folder: " .. restored_path
     else
-        print("MotionBridge: no saved project path found. Click 📂 to connect.")
+        print("DAELink: no saved project path found. Click 📂 to connect.")
     end
     -- Always enable buttons — connect_to_project() handles the gate on each action
     set_ui_enabled(true)
 end
 
 function MainWindow.On.Browse.Clicked(ev)
-    local chosenPath = fu:RequestDir("Choose MotionBridge Project Media Folder...")
+    local chosenPath = fu:RequestDir("Choose DAELink Project Media Folder...")
     if not chosenPath or chosenPath == "" then
         print("No folder selected.")
         return
@@ -2944,7 +2885,7 @@ function MainWindow.On.NestLinkedInAEComp.Clicked(ev)
     -- Validate placeholder is under the playhead before showing the dialog
     local placeholder_mpi = get_mpi_by_name(_G.CONSTANTS.PLACEHOLDER_TL_NAME)
     if not placeholder_mpi then
-        alert("Error: MotionBridgePlaceholder timeline not found in Media Pool.")
+        alert("Error: DAELinkPlaceholder timeline not found in Media Pool.")
         return
     end
     local base_timeline = _G.project:GetCurrentTimeline()
@@ -2954,7 +2895,7 @@ function MainWindow.On.NestLinkedInAEComp.Clicked(ev)
     end
     local placeholder = base_timeline:GetCurrentVideoItem()
     if not placeholder or placeholder:GetName() ~= placeholder_mpi:GetName() then
-        alert("Error: No MotionBridgePlaceholder in top active video layer.\n\nBring the playhead over a placeholder clip before using this button.")
+        alert("Error: No DAELinkPlaceholder in top active video layer.\n\nBring the playhead over a placeholder clip before using this button.")
         return
     end
 
@@ -3004,8 +2945,9 @@ function MainWindow.On.GenerateProxy.Clicked(ev)
 end 
 ]]
 
-function MainWindow.On.Help.Clicked(ev)
-    show_help_window()
+function MainWindow.On.OpenAE.Clicked(ev)
+    if not connect_to_project() then return end
+    open_ae_project()
 end
 
 function MainWindow.On.MainWind.Close(ev)

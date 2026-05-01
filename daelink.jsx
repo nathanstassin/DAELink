@@ -1,6 +1,6 @@
-function MotionBridge(thisObj) {
+function DAELink(thisObj) {
     /*
-    MotionBridge  | v0.95 Beta | © 2025-2026 Nathan Stassin
+    DAELink  | v0.96 Beta | © 2025-2026 Nathan Stassin
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -29,30 +29,31 @@ function MotionBridge(thisObj) {
     Privacy:      All data stored locally. No data is transmitted to external servers.
 
     Version History:
-    - 0.9 Beta - 17/01/2026 
+    - 0.9 Beta - 17/01/2026
     - 0.95 Beta - 14/04/2026 - UI improvements
-    */ 
+    - 0.96 Beta - 23/04/2026 - Live AE project link (aeProjectPath in JSON) + divergence check
+    */
     // GLOBAL VARIABLES 
     var CONFIG = {
-        scriptName: "MotionBridge",
-        version: 0.95,
+        scriptName: "DAELink",
+        version: 0.96,
         schemaVersion: 1,
-        websiteurl: "https://nathanstassin.com/motionbridge",
-        projectIDPrefix: "MotionBridgeProjectID:",
+        websiteurl: "https://nathanstassin.com/daelink",
+        projectIDPrefix: "DAELinkProjectID:",
         folderNames: {
             linkedComps: "0_LinkedComps",
-            importedMedia: "0_MotionBridgeImports"
+            importedMedia: "0_DAELinkImports"
         },
         directoryNames: {
-            root: "motionbridge",
+            root: "daelink",
             renders: "Renders",
             support: "Support"
         },
         fileNames: {
-            json: "motionbridge.json"
+            json: "daelink.json"
         },
         layerNames: {
-            markers: "MotionBridgeMarkers"
+            markers: "DAELinkMarkers"
         }
     };
 
@@ -79,7 +80,7 @@ function MotionBridge(thisObj) {
         panelA : "Basics",
         panelAbullets : [
             "• Initialise project in Davinci Resolve.",
-            "• Each project has its own motionbridge folder, with subfolders:",
+            "• Each project has its own daelink folder, with subfolders:",
             "       " + ICONS.downRightArrow + " Renders: all renders from AE",
             "       " + ICONS.downRightArrow + " Support: JSON file which contains link data"
         ],
@@ -92,9 +93,9 @@ function MotionBridge(thisObj) {
         ],
         panelC : "Markers " + ICONS.upTriangle + " | " + ICONS.downTriangle,
         panelCbullets : [
-            "• " + ICONS.upTriangle + " Export Markers button sends markers from MotionBridgeMarkers layer to Davinci nest",
+            "• " + ICONS.upTriangle + " Export Markers button sends markers from DAELinkMarkers layer to Davinci nest",
             "       " + ICONS.downRightArrow + " Click Import Markers button on Davinci side to update",
-            "• " + ICONS.downTriangle + " Import Markers button receives markers from Davinci, updating MotionBridgeMarkers layer",
+            "• " + ICONS.downTriangle + " Import Markers button receives markers from Davinci, updating DAELinkMarkers layer",
             "       " + ICONS.downRightArrow + " Imports markers set with Export Markers button on Davinci side"
         ],
         panelD : "Renders " + ICONS.plus + " | " + ICONS.play, 
@@ -103,7 +104,7 @@ function MotionBridge(thisObj) {
             "       " + ICONS.downRightArrow + " Hint: Make your own templates in the render Queue window",
             "• " + ICONS.plus + " Queue button adds currently active comp to the render queue with selected template.",
             "• " + ICONS.play + " Render button adds active comp to queue with selected template and directly renders queue",
-            "       " + ICONS.downRightArrow + " Renders go to 'Renders' folder in MotionBridge project folder",
+            "       " + ICONS.downRightArrow + " Renders go to 'Renders' folder in DAELink project folder",
             "       " + ICONS.downRightArrow + " Click Refresh Render button on Davinci side to update to latest render"
         ]
     };
@@ -172,7 +173,9 @@ function MotionBridge(thisObj) {
         setPanelMargins(linkCompositionsPanel, STYLES.margins.panel);
         var hGroup1 = createButtonGroup(linkCompositionsPanel);
         var importNewCompsBtn = hGroup1.add("button", undefined, ICONS.downArrow + " Import Linked Comps");
+        importNewCompsBtn.helpTip = "Creates new AE comps from nests already linked in DaVinci.\nUse after clicking " + ICONS.upArrow + " Make AE Comp From Placeholder in DaVinci.";
         var linkActiveCompBtn = hGroup1.add("button", undefined, ICONS.upArrow + " Link Active Comp");
+        linkActiveCompBtn.helpTip = "Links active comp to a new DaVinci Nest.\nClick " + ICONS.downArrow + " Import Linked Comps in DaVinci to complete the link.";
 
         // PANEL 2 — Linked Active Comp
         var activeCompPanel = myPanel.add("panel", undefined, "Linked Active Comp");
@@ -181,16 +184,21 @@ function MotionBridge(thisObj) {
         // Marker buttons
         var hGroup2 = createButtonGroup(activeCompPanel);
         var importMarkersBtn = hGroup2.add("button", undefined, ICONS.downTriangle + " Import Markers");
+        importMarkersBtn.helpTip = "Pulls markers from the linked DaVinci nest into the DAELinkMarkers layer.\nUse after clicking " + ICONS.upTriangle + " Export Markers in DaVinci.";
         var exportMarkersBtn = hGroup2.add("button", undefined, ICONS.upTriangle + " Export Markers");
+        exportMarkersBtn.helpTip = "Sends markers from the DAELinkMarkers layer to the linked DaVinci nest.\nApply in DaVinci with " + ICONS.downTriangle + " Import Markers.";
 
         // Template + Add to Queue
         var hGroup3 = createButtonGroup(activeCompPanel);
         templateDropdown = hGroup3.add("dropdownlist", undefined, []);
+        templateDropdown.helpTip = "Output module template to use when adding this comp to the render queue.";
 
         // Render buttons
         var hGroup4 = createButtonGroup(activeCompPanel);
         var addToQBtn = hGroup4.add("button", undefined, ICONS.plus + " Queue");
+        addToQBtn.helpTip = "Adds the active comp to the AE render queue with the selected output template.";
         var renderBtn = hGroup4.add("button", undefined, ICONS.play + " Render");
+        renderBtn.helpTip = "Adds the active comp to the render queue with the selected template and immediately starts rendering the queue.\nClick Refresh Render in DaVinci afterward to pick up the new file.";
 
         // Branding - in footer group
         var footerGroup = myPanel.add("group");
@@ -243,8 +251,8 @@ function MotionBridge(thisObj) {
                     return false;
                 }
 
-                if (linkedMatches.length === 1 && linkedMatches[0].comment === CONFIG.projectIDPrefix + data.projectid) {
-                    return true;
+                if (linkedMatches.length === 1 && (linkedMatches[0].comment === CONFIG.projectIDPrefix + data.projectid || linkedMatches[0].comment === "MotionBridgeProjectID:" + data.projectid)) {
+                    return ensureAEProjectPathMatches();
                 }
 
                 jsonFile = null;
@@ -261,27 +269,30 @@ function MotionBridge(thisObj) {
 
                 if (savedPath) {
                     var testJson = new File(savedPath + "/" + CONFIG.directoryNames.root + "/" + CONFIG.directoryNames.support + "/" + CONFIG.fileNames.json);
-                    if (testJson.exists) {
-                        // Path still valid — connect silently
-                        JSONfilePath = savedPath + "/" + CONFIG.directoryNames.root + "/" + CONFIG.directoryNames.support + "/" + CONFIG.fileNames.json;
+                    var legacyJson = new File(savedPath + "/motionbridge/" + CONFIG.directoryNames.support + "/motionbridge.json");
+                    if (testJson.exists || legacyJson.exists) {
+                        // Path still valid — connect silently (prefer new path, fall back to legacy)
+                        JSONfilePath = testJson.exists
+                            ? savedPath + "/" + CONFIG.directoryNames.root + "/" + CONFIG.directoryNames.support + "/" + CONFIG.fileNames.json
+                            : savedPath + "/motionbridge/" + CONFIG.directoryNames.support + "/motionbridge.json";
                         jsonFile = new File(JSONfilePath);
                         if (!versionCheck()) { jsonFile = null; return false; }
-                        if (findOrCreateMotionBridgeFolders()) {
+                        if (findOrCreateDAELinkFolders()) {
                             projectMediaPath = savedPath;
                             if (templateDropdown.items.length <= 1) { loadTemplates(); templateDropdown.selection = 0; }
-                            return true;
+                            return ensureAEProjectPathMatches();
                         }
                         jsonFile = null;
                         return false;
                     }
                     // Linked, path saved, but folder has moved — ask to relocate
-                    alert("MotionBridge project folder not found at:\n" + savedPath + "\n\nPlease navigate to its new location.");
+                    alert("DAELink project folder not found at:\n" + savedPath + "\n\nPlease navigate to its new location.");
                 }
                 // Linked but no path in settings yet — fall through to folder picker
             }
             // No folder comment — first time connecting this AE project
 
-            var folder = Folder.selectDialog("Open this project's motionbridge folder");
+            var folder = Folder.selectDialog("Open this project's daelink folder");
             if (!folder) return false;
             return connectToFolder(folder);
         }
@@ -290,31 +301,36 @@ function MotionBridge(thisObj) {
             var normalizedPath = folder.fsName.replace(/\\/g, "/");
             var lowerPath = normalizedPath.toLowerCase();
 
-            if (lowerPath.match(new RegExp("/" + CONFIG.directoryNames.root + "/?$", "i"))) {
-                var lastSlashIndex = normalizedPath.lastIndexOf("/motionbridge");
-                if (lastSlashIndex === -1) lastSlashIndex = normalizedPath.lastIndexOf("/MotionBridge");
-                if (lastSlashIndex !== -1) normalizedPath = normalizedPath.substring(0, lastSlashIndex);
+            if (lowerPath.match(/\/(daelink|motionbridge)\/?$/i)) {
+                var lastSlash = normalizedPath.lastIndexOf("/daelink");
+                if (lastSlash === -1) lastSlash = normalizedPath.lastIndexOf("/DAELink");
+                if (lastSlash === -1) lastSlash = normalizedPath.lastIndexOf("/motionbridge");
+                if (lastSlash !== -1) normalizedPath = normalizedPath.substring(0, lastSlash);
             }
 
-            var motionbridgeFolder = new Folder(normalizedPath + "/motionbridge");
-            if (!motionbridgeFolder.exists) {
-                alert("No motionbridge folder found at that location.");
+            var daelinkFolder = new Folder(normalizedPath + "/" + CONFIG.directoryNames.root);
+            var legacyRootFolder = new Folder(normalizedPath + "/motionbridge");
+            var isLegacyProject = !daelinkFolder.exists && legacyRootFolder.exists;
+            if (!daelinkFolder.exists && !legacyRootFolder.exists) {
+                alert("No daelink or motionbridge folder found at that location.");
                 return false;
             }
 
-            JSONfilePath = normalizedPath + "/" + CONFIG.directoryNames.root + "/" + CONFIG.directoryNames.support + "/" + CONFIG.fileNames.json;
+            var rootDir = isLegacyProject ? "motionbridge" : CONFIG.directoryNames.root;
+            var jsonName = isLegacyProject ? "motionbridge.json" : CONFIG.fileNames.json;
+            JSONfilePath = normalizedPath + "/" + rootDir + "/" + CONFIG.directoryNames.support + "/" + jsonName;
             jsonFile = new File(JSONfilePath);
 
             if (!versionCheck()) { jsonFile = null; return false; }
 
-            // findOrCreateMotionBridgeFolders writes the Davinci projectid into the folder comment
+            // findOrCreateDAELinkFolders writes the Davinci projectid into the folder comment
             // (or validates it if already set). After it runs, getLinkedProjectID() is reliable.
-            if (findOrCreateMotionBridgeFolders()) {
+            if (findOrCreateDAELinkFolders()) {
                 projectMediaPath = normalizedPath;
                 var projectID = getLinkedProjectID();
                 if (projectID) saveProjectPath(projectID, projectMediaPath);
                 if (templateDropdown.items.length <= 1) { loadTemplates(); templateDropdown.selection = 0; }
-                return true;
+                return ensureAEProjectPathMatches();
             }
             jsonFile = null;
             return false;
@@ -325,7 +341,7 @@ function MotionBridge(thisObj) {
             // Force a fresh folder selection regardless of current state
             jsonFile = null;
             projectMediaPath = null;
-            var folder = Folder.selectDialog("Open this project's motionbridge folder");
+            var folder = Folder.selectDialog("Open this project's daelink folder");
             if (!folder) return;
             connectToFolder(folder);
         };
@@ -398,11 +414,15 @@ function MotionBridge(thisObj) {
         // Read the Davinci projectid from the 0_LinkedComps folder comment.
         // Returns the ID string, or null if no linked folder exists in this AE project.
         var prefix = CONFIG.projectIDPrefix;
+        var legacyPrefix = "MotionBridgeProjectID:";
         var matches = findFoldersByName(CONFIG.folderNames.linkedComps, null);
         if (matches.length === 1) {
             var comment = matches[0].comment || "";
             if (comment.indexOf(prefix) === 0) {
                 return comment.substring(prefix.length);
+            }
+            if (comment.indexOf(legacyPrefix) === 0) {
+                return comment.substring(legacyPrefix.length);
             }
         }
         return null;
@@ -417,6 +437,46 @@ function MotionBridge(thisObj) {
     function loadProjectPath(projectID) {
         var dict = loadProjectSettings();
         return dict[projectID] || null;
+    }
+
+    // LIVE-LINK VALIDATION
+    // daelink.json carries `aeProjectPath` — the fsName of the single AE project
+    // currently acting as the live link for this DaVinci project. Called at the end of
+    // every successful connection path. On divergence the user must confirm the takeover
+    // before proceeding; cancelling aborts the current action without clearing state.
+    function ensureAEProjectPathMatches() {
+        if (!app.project.file) {
+            alert("Please save your After Effects project before connecting to DAELink.\n\nDAELink needs to know which project file is linked to this DaVinci project.");
+            return false;
+        }
+
+        var currentPath = app.project.file.fsName.replace(/\\/g, "/");
+        var data = loadJSONData();
+        if (!data) return false;
+
+        var storedPath = data.aeProjectPath || "";
+
+        if (storedPath === currentPath) return true;
+
+        if (storedPath === "") {
+            data.aeProjectPath = currentPath;
+            saveJSONData(data);
+            return true;
+        }
+
+        var proceed = confirm(
+            "This DaVinci project is currently linked to a different AE project file:\n\n" +
+            storedPath + "\n\n" +
+            "Continuing will make this file the new live link.\n\n" +
+            "Any new changes must be made from this project file. Old project files should be saved for archival purposes — keep one live project file at a time.\n\n" +
+            "Continue?"
+        );
+
+        if (!proceed) return false;
+
+        data.aeProjectPath = currentPath;
+        saveJSONData(data);
+        return true;
     }
 
     // UI HELPERS
@@ -668,7 +728,7 @@ function MotionBridge(thisObj) {
         var scriptSchema = CONFIG.schemaVersion;
 
         if (savedSchema !== scriptSchema) {
-            alert("MotionBridge schema mismatch detected.\n\nProject schema: v" + savedSchema + "\nScript schema: v" + scriptSchema + "\n\nThe project was created by an incompatible version of MotionBridge. Please align script versions in both AE and Resolve.");
+            alert("DAELink schema mismatch detected.\n\nProject schema: v" + savedSchema + "\nScript schema: v" + scriptSchema + "\n\nThe project was created by an incompatible version of DAELink. Please align script versions in both AE and Resolve.");
             return false;
         }
         return true;
@@ -756,7 +816,7 @@ function MotionBridge(thisObj) {
         defineJSON();
         jsonFile = new File(JSONfilePath);
         if (!jsonFile.exists) {
-            alert("MotionBridge data file not found at " + jsonFile.fsName);
+            alert("DAELink data file not found at " + jsonFile.fsName);
             return;
         }
 
@@ -915,7 +975,7 @@ function MotionBridge(thisObj) {
     }
 
     // MARKER HELPERS
-    function findOrCreateMotionBridgeFolders() {
+    function findOrCreateDAELinkFolders() {
         var data = loadJSONData();
         var targetRootName = CONFIG.folderNames.linkedComps;
         var targetSubName  = CONFIG.folderNames.importedMedia;
@@ -930,8 +990,10 @@ function MotionBridge(thisObj) {
 
         if (linkedMatches.length === 1) {
             linkedCompsFolder = linkedMatches[0];
-            if (linkedCompsFolder.comment !== CONFIG.projectIDPrefix + data.projectid) { 
-                alert("This AE project is linked to a different MotionBridge project ID");
+            var expectedID = CONFIG.projectIDPrefix + data.projectid;
+            var legacyID = "MotionBridgeProjectID:" + data.projectid;
+            if (linkedCompsFolder.comment !== expectedID && linkedCompsFolder.comment !== legacyID) {
+                alert("This AE project is linked to a different DAELink project ID");
                 linkedCompsFolder = null;
                 return null;
             }
@@ -940,7 +1002,7 @@ function MotionBridge(thisObj) {
             linkedCompsFolder.comment = CONFIG.projectIDPrefix + data.projectid;
         }
 
-        // Now look for "0_MotionBridgeImports" inside it
+        // Now look for "0_DAELinkImports" inside it
         var motionBridgeMatches = findFoldersByName(targetSubName, linkedCompsFolder);
 
         if (motionBridgeMatches.length > 1) {
@@ -998,12 +1060,13 @@ function MotionBridge(thisObj) {
 
     function getOrCreateMarkersLayer(comp) {
         for (var i = 1; i <= comp.numLayers; i++) {
-            if (comp.layer(i).name === markersLayerName) { 
+            if (comp.layer(i).name === markersLayerName || comp.layer(i).name === "MotionBridgeMarkers") {
                 return comp.layer(i);
             }
         }
         var layer = comp.layers.addNull();
         layer.name = markersLayerName;
+        layer.enabled = false;
         return layer;
     }
 
@@ -1199,4 +1262,4 @@ function MotionBridge(thisObj) {
         }
     }
 }
-MotionBridge(this);
+DAELink(this);
