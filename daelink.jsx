@@ -1,6 +1,6 @@
 function DAELink(thisObj) {
     /*
-    DAELink  | v0.96 Beta | © 2025-2026 Nathan Stassin
+    DAELink  | v0.91 Beta | © 2025-2026 Nathan Stassin
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -15,28 +15,30 @@ function DAELink(thisObj) {
     You should have received a copy of the GNU General Public License
     along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-    Description:  Links compositions to nests in Davinci with a dockable UI panel. 
-                  1-click renders and shared markers across programs. 
+    Description:  Links compositions to nests in DaVinci Resolve with a dockable UI panel.
+                  1-click renders and shared markers across programs.
 
     Author:       Nathan Stassin  |  https://www.nathanstassin.com
 
-    Requirements: Adobe After Effects 2025 or later 
+    Requirements: Adobe After Effects 2025 or later
 
-    Intallation:  Drag this file into the SciptUI Panels folder on your computer
+    Installation: Drag this file into the ScriptUI Panels folder on your computer.
                   Mac: /Applications/After Effects #version#/Scripts/ScriptUI Panels/
-                  Windows: \Program Files\Adobe/Adobe After Effects #version#\Support Files\Scripts\ScriptUI Panels\
+                  Windows: \Program Files\Adobe\Adobe After Effects #version#\Support Files\Scripts\ScriptUI Panels\
 
     Privacy:      All data stored locally. No data is transmitted to external servers.
 
     Version History:
-    - 0.9 Beta - 17/01/2026
-    - 0.95 Beta - 14/04/2026 - UI improvements
-    - 0.96 Beta - 23/04/2026 - Live AE project link (aeProjectPath in JSON) + divergence check
+    - 0.9 Beta  - 17/01/2026 - Initial public beta (released as MotionBridge).
+    - 0.91 Beta - 04/05/2026 - Renamed from MotionBridge to DAELink.
+                               UI overhaul, schema versioning, auto-reconnect persistence,
+                               live AE project link + divergence check, comp-marker workflow,
+                               conditional A1 unmute on Refresh Render, button tooltips.
     */
     // GLOBAL VARIABLES 
     var CONFIG = {
         scriptName: "DAELink",
-        version: 0.96,
+        version: 0.91,
         schemaVersion: 1,
         websiteurl: "https://nathanstassin.com/daelink",
         projectIDPrefix: "DAELinkProjectID:",
@@ -76,33 +78,33 @@ function DAELink(thisObj) {
         title: "How " + CONFIG.scriptName + " works",
         panelA : "Basics",
         panelAbullets : [
-            "• Initialise project in Davinci Resolve.",
+            "• Initialise project in DaVinci Resolve.",
             "• Each project has its own daelink folder, with subfolders:",
             "       " + ICONS.downRightArrow + " Renders: all renders from AE",
             "       " + ICONS.downRightArrow + " Support: JSON file which contains link data"
         ],
-        panelB : "Linking Compositions with Davinci Project " + ICONS.upArrow + " | " + ICONS.downArrow, 
+        panelB : "Linking Compositions with DaVinci project " + ICONS.upArrow + " | " + ICONS.downArrow,
         panelBbullets : [
-            "• " + ICONS.upArrow + " Link Active Comp button establishes a link to a Davinci nest for currently active comp",
-            "       " + ICONS.downRightArrow + " Click 'Import Linked Comps' button on Davinci side to finalise the link",
-            "• " + ICONS.downArrow + " Import Linked Comps button finalises links established from Davinci",
-            "       " + ICONS.downRightArrow + " Click 'Replace Linked Layers With Nested AE Comp' button in Davinci to establish link"    
+            "• " + ICONS.upArrow + " Link Active Comp button establishes a link to a DaVinci nest for the currently active comp",
+            "       " + ICONS.downRightArrow + " Click 'Import Linked Comps' button on DaVinci side to finalise the link",
+            "• " + ICONS.downArrow + " Import Linked Comps button finalises links established from DaVinci",
+            "       " + ICONS.downRightArrow + " Click 'Replace Linked Layers With Nested AE Comp' button in DaVinci to establish link"
         ],
         panelC : "Markers " + ICONS.upTriangle + " | " + ICONS.downTriangle,
         panelCbullets : [
-            "• " + ICONS.upTriangle + " Export Markers button sends comp markers to the linked Davinci nest",
-            "       " + ICONS.downRightArrow + " Click Import Markers button on Davinci side to update",
-            "• " + ICONS.downTriangle + " Import Markers button receives markers from Davinci as comp markers on the active comp",
-            "       " + ICONS.downRightArrow + " Imports markers set with Export Markers button on Davinci side"
+            "• " + ICONS.upTriangle + " Export Markers button sends comp markers to the linked DaVinci nest",
+            "       " + ICONS.downRightArrow + " Click Import Markers button on DaVinci side to update",
+            "• " + ICONS.downTriangle + " Import Markers button receives markers from DaVinci as comp markers on the active comp",
+            "       " + ICONS.downRightArrow + " Imports markers set with Export Markers button on DaVinci side"
         ],
-        panelD : "Renders " + ICONS.plus + " | " + ICONS.play, 
-        panelDbullets : [    
-            "• Select Render Template... dropdown determines render template for currently active comp",
-            "       " + ICONS.downRightArrow + " Hint: Make your own templates in the render Queue window",
-            "• " + ICONS.plus + " Queue button adds currently active comp to the render queue with selected template.",
-            "• " + ICONS.play + " Render button adds active comp to queue with selected template and directly renders queue",
-            "       " + ICONS.downRightArrow + " Renders go to 'Renders' folder in DAELink project folder",
-            "       " + ICONS.downRightArrow + " Click Refresh Render button on Davinci side to update to latest render"
+        panelD : "Renders " + ICONS.plus + " | " + ICONS.play,
+        panelDbullets : [
+            "• Select Render Template... dropdown determines render template for the currently active comp",
+            "       " + ICONS.downRightArrow + " Hint: Make your own templates in the Render Queue window",
+            "• " + ICONS.plus + " Queue button adds the currently active comp to the render queue with the selected template",
+            "• " + ICONS.play + " Render button adds the active comp to the queue with the selected template and renders immediately",
+            "       " + ICONS.downRightArrow + " Renders go to the 'Renders' folder in the DAELink project folder",
+            "       " + ICONS.downRightArrow + " Click Refresh Render button on DaVinci side to update to the latest render"
         ]
     };
 
@@ -255,7 +257,7 @@ function DAELink(thisObj) {
                 projectMediaPath = null;
             }
 
-            // Read the Davinci projectid from the 0_LinkedComps folder comment —
+            // Read the DaVinci projectid from the 0_LinkedComps folder comment —
             // this is the stable identity for this AE project's link
             var projectID = getLinkedProjectID();
 
@@ -319,7 +321,7 @@ function DAELink(thisObj) {
 
             if (!versionCheck()) { jsonFile = null; return false; }
 
-            // findOrCreateDAELinkFolders writes the Davinci projectid into the folder comment
+            // findOrCreateDAELinkFolders writes the DaVinci projectid into the folder comment
             // (or validates it if already set). After it runs, getLinkedProjectID() is reliable.
             if (findOrCreateDAELinkFolders()) {
                 projectMediaPath = normalizedPath;
@@ -386,7 +388,7 @@ function DAELink(thisObj) {
     // SETTINGS PERSISTENCE
     // app.settings holds one entry: SETTINGS_DICT_KEY → JSON string of
     // { "davinci_project_uuid": "/folder/path", ... }
-    // The key for each project is the Davinci projectid, read from the
+    // The key for each project is the DaVinci projectid, read from the
     // 0_LinkedComps folder comment — the same anchor already used by the script.
     var SETTINGS_SECTION = CONFIG.scriptName;
     var SETTINGS_DICT_KEY = "projectFolderMap";
@@ -407,7 +409,7 @@ function DAELink(thisObj) {
     }
 
     function getLinkedProjectID() {
-        // Read the Davinci projectid from the 0_LinkedComps folder comment.
+        // Read the DaVinci projectid from the 0_LinkedComps folder comment.
         // Returns the ID string, or null if no linked folder exists in this AE project.
         var prefix = CONFIG.projectIDPrefix;
         var legacyPrefix = "MotionBridgeProjectID:";
@@ -536,7 +538,7 @@ function DAELink(thisObj) {
                     system.callSystem("open " + CONFIG.websiteurl);
                 }
             } catch (error) {
-                alert("Cannot Open URL\nPlease visit: " + CONFIG.websiteurl);
+                alert("Could not open URL.\nPlease visit: " + CONFIG.websiteurl);
             }
         };
 
@@ -550,37 +552,15 @@ function DAELink(thisObj) {
     function setPanelMargins(panel, amount) {
         panel.margins = [amount, amount, amount, amount];
         panel.alignChildren = ["fill", "fill"];
-
-    }
-
-    function alignAndDisableUIElements(elements) {
-        for (var i = 0; i < elements.length; i++) {
-            elements[i].alignment = ["fill", "center"];
-            elements[i].enabled = false;
-        }
     }
 
     function confirmPropertyChange(propertyName, davinciValue, aeValue, unit) {
         unit = unit || ""; // Optional unit like "FPS"
         return confirm(
-            "Change active comp " + propertyName + " to match Davinci " + propertyName + "?\n" +
-            "Davinci " + propertyName + ": " + davinciValue + unit + "\n" +
-            "Active Comp " + propertyName + ": " + aeValue + unit
+            "Change active comp " + propertyName + " to match DaVinci " + propertyName + "?\n" +
+            "DaVinci " + propertyName + ": " + davinciValue + unit + "\n" +
+            "Active comp " + propertyName + ": " + aeValue + unit
         );
-    }
-
-    function addDivider(parent, color, height, margin) {
-        var divider = parent.add("panel");
-        divider.alignment = ["fill", "top"];
-        divider.minimumSize.height = height || 1;
-        divider.maximumSize.height = height || 1;
-        divider.margins = margin || 0;
-        if (color) {
-            try {
-                divider.graphics.backgroundColor = divider.graphics.newBrush(divider.graphics.BrushType.SOLID_COLOR, color);
-            } catch (e) { } // Some versions of ExtendScript don't fully support custom brushes — safely ignore.
-        }
-        return divider;
     }
 
     // IMPORT HELPERS
@@ -649,13 +629,13 @@ function DAELink(thisObj) {
                 }
             }
 
-            // Handle pixel aspect ratio (likely irrelevant in most workflows)
+            // Handle non-square pixel aspect ratio (legacy SD/anamorphic footage)
             if (layerData.pixelAspect !== "N/A") {
                 if (layerData.pixelAspect !== 1) {
-                    if (confirm("Legacy Pixel Aspect Ratio: " + layerData.pixelAspect + " deteceted for layer: " + layerData.layerName + ".\n Change to square?")) {
+                    if (confirm("Legacy pixel aspect ratio " + layerData.pixelAspect + " detected for layer '" + layerData.layerName + "'.\n\nChange to square?")) {
                         importedItem.pixelAspect = 1;
                     } else {
-                        alert("Pixel Aspect Ratio unchanged - sizing may appear incorrect.");
+                        alert("Pixel aspect ratio unchanged — sizing may appear incorrect.");
                         importedItem.pixelAspect = layerData.pixelAspect;
                     }
                 }
@@ -687,13 +667,13 @@ function DAELink(thisObj) {
                 if (layerData.flipY === "true") { yScaleMultiplier = -1; }
                 currentLayer.scale.setValue([layerData.zoomX * 100 * xScaleMultiplier, layerData.zoomY * 100 * yScaleMultiplier]);
                 currentLayer.opacity.setValue(layerData.opacity);
-                // AE and Davinci rotate in opposing directions
+                // AE and DaVinci rotate in opposing directions
                 currentLayer.rotation.setValue(-1 * layerData.rotationAngle);
-                // AE 0 position top right, Davinci 0 position in center
+                // AE 0 position is top-left, DaVinci 0 position is centre
                 var xResOffset = 0.5 * compData.resolutionWidth;
                 var yResOffset = 0.5 * compData.resolutionHeight;
                 currentLayer.position.setValue([layerData.pan + xResOffset, -1 * layerData.tilt + yResOffset]);
-                // currentLayer.anchorPoint.setValue([layerData.anchorPointX + xResOffset, layerData.anchorPointY + yResOffset]) // - doesn't work - Resolve anchor only affects rotation
+                // Anchor point intentionally not transferred — in DaVinci it only affects rotation pivot, not layer position.
             }
         }
     }
@@ -718,8 +698,8 @@ function DAELink(thisObj) {
         var data = loadJSONData();
         if (!data) return false;
 
-        // schemaVersion gates cross-script JSON compatibility. Pre-0.95 projects
-        // have no schemaVersion field; treat them as schema 1.
+        // schemaVersion gates cross-script JSON compatibility. Early-beta
+        // projects have no schemaVersion field; treat them as schema 1.
         var savedSchema = data.schemaVersion || 1;
         var scriptSchema = CONFIG.schemaVersion;
 
@@ -733,13 +713,13 @@ function DAELink(thisObj) {
     function linkWithDavinci() {
         var data = loadJSONData();
         if (!data || !data.compositions) {
-            alert("No compositions found – please set up project in Davinci");
+            alert("No compositions found — please set up the project in DaVinci Resolve first.");
             return;
         }
 
         var exists = findCompKeyByAeID(data, activeComp.id);
         if (exists) {
-            alert("Active comp '" + activeComp.name + "' already linked with Davinci Project");
+            alert("Active comp '" + activeComp.name + "' is already linked to this DaVinci project.");
             return;
         }
 
@@ -751,23 +731,23 @@ function DAELink(thisObj) {
             }
         }
 
-        if (data.projectFPS !== activeComp.frameRate) { 
+        if (data.projectFPS !== activeComp.frameRate) {
             if (confirmPropertyChange("frame rate", data.projectFPS, activeComp.frameRate, "FPS")) {
-                activeComp.frameRate = data.projectFPS; 
-                alert("Frame rate changed to: " + data.projectFPS + "FPS");
+                activeComp.frameRate = data.projectFPS;
+                alert("Frame rate changed to " + data.projectFPS + " FPS.");
             } else {
-                alert("Frame rates don't match - operation canceled");
+                alert("Frame rates don't match — operation cancelled.");
                 return false;
             }
         }
 
         if (activeComp.displayStartFrame !== 0) {
-            if (confirm("Change comp start frame (currently: " + activeComp.displayStartFrame + ") to 0?")){
+            if (confirm("Active comp start frame is " + activeComp.displayStartFrame + ". Reset to 0?")) {
                 activeComp.displayStartFrame = 0;
             }
             else {
-                alert("Comp start frame must be 0 to link - operation cancelled");
-                return false; 
+                alert("Comp start frame must be 0 to link — operation cancelled.");
+                return false;
             }
         }
 
@@ -850,11 +830,12 @@ function DAELink(thisObj) {
                     for (var i = 0; i < markers.length; i++) {
                         var m = markers[i];
                         var startTime = m.recordFrame / compData.fps;
-                        var myMarker = new MarkerValue(m.name + "\n" + m.note);  // \n here for some reason \r only works one way
-                        // Davinci has no 0-frame markers; its 1-frame markers are AE's 0-duration ones.
+                        // \n separates name and note in AE marker comments — \r is one-way only.
+                        var myMarker = new MarkerValue(m.name + "\n" + m.note);
+                        // DaVinci has no 0-frame markers; its 1-frame markers map to AE's 0-duration ones.
                         myMarker.duration = m.duration <= 1 ? 0 : m.duration / compData.fps;
 
-                        // Color label by index, not name (mismatch between AE and Davinci)
+                        // Set label by colour index — AE and DaVinci colour names don't align.
                         myMarker.label = m.color;
                         currentComp.markerProperty.setValueAtTime(startTime, myMarker);
                     }
@@ -874,7 +855,7 @@ function DAELink(thisObj) {
         }
         
         app.endUndoGroup();
-        if (!btnClickResult) {alert("No new comps to link!");}
+        if (!btnClickResult) { alert("No new comps to link."); }
     }
 
     // RENDER HELPERS
@@ -891,11 +872,11 @@ function DAELink(thisObj) {
                 return true;
             }
             else {
-                alert("Active comp " + "'" + activeComp.name + "'" + " not linked in project.\n1. Pre-link with 'Link Active Comp' button in AE \n2. Finalise link with 'Import Linked Comps' button in Davinci");
+                alert("Active comp '" + activeComp.name + "' is not linked to this project.\n\nTo link a comp:\n1. In AE: click " + ICONS.upArrow + " Link Active Comp.\n2. In DaVinci: click " + ICONS.downArrow + " Import Linked Comps.");
             }
         } else {
-            alert("No active comp!");
-            return false; 
+            alert("No active comp.");
+            return false;
         }
     }
 
@@ -1019,12 +1000,12 @@ function DAELink(thisObj) {
         var davinciFPS = compData.fps;
         var activeCompFPS = activeComp.frameRate; 
 
-        if (Math.abs(davinciFPS - activeCompFPS) > 0.01) { 
+        if (Math.abs(davinciFPS - activeCompFPS) > 0.01) {
             if (confirmPropertyChange("frame rate", davinciFPS, activeCompFPS, "FPS")) {
-                activeComp.frameRate = davinciFPS; 
-                alert("Frame rate changed to: " + davinciFPS + "FPS");
+                activeComp.frameRate = davinciFPS;
+                alert("Frame rate changed to " + davinciFPS + " FPS.");
             } else {
-                alert("Frame rates don't match - operation canceled");
+                alert("Frame rates don't match — operation cancelled.");
                 return false;
             }
         }
@@ -1032,19 +1013,19 @@ function DAELink(thisObj) {
         if (compData.aeID == activeComp.id) {
             if (compData.name !== activeComp.name) {
                 if (confirmPropertyChange("name", compData.name, activeComp.name)) {
-                    activeComp.name = compData.name; 
-                    alert("Active comp renamed to: " + compData.name);
+                    activeComp.name = compData.name;
+                    alert("Active comp renamed to '" + compData.name + "'.");
                 } else {
-                    alert("Names don't match - operation canceled");
+                    alert("Names don't match — operation cancelled.");
                     return false;
                 }
             }
             if (compData.compStartFrame !== activeComp.displayStartFrame) {
-                if (confirmPropertyChange("Start Frame", compData.compStartFrame, activeComp.displayStartFrame)) {
-                    activeComp.displayStartFrame = compData.compStartFrame; 
-                    alert("Active comp start frame changed to: " + compData.compStartFrame);
+                if (confirmPropertyChange("start frame", compData.compStartFrame, activeComp.displayStartFrame)) {
+                    activeComp.displayStartFrame = compData.compStartFrame;
+                    alert("Active comp start frame changed to " + compData.compStartFrame + ".");
                 } else {
-                    alert("Start Frames don't match - operation canceled");
+                    alert("Start frames don't match — operation cancelled.");
                     return false;
                 }
             }
@@ -1076,11 +1057,11 @@ function DAELink(thisObj) {
                 note = "";
             }
 
-            // Handle markers starting before 0 (Doesn't exist in Davinci)
+            // Clamp markers that start before frame 0 (DaVinci has no negative timeline).
             var recordFrame = Math.round(keyTime * fps);
             var duration = Math.round(markerValue.duration * fps);
             if (recordFrame < 0) {
-                duration = duration + recordFrame; // subtraction because it's negative
+                duration = duration + recordFrame; // recordFrame is negative, so this trims duration
                 recordFrame = 0;
             }
 
@@ -1110,16 +1091,17 @@ function DAELink(thisObj) {
         for (var i = 0; i < markers.length; i++) {
             var m = markers[i];
             var startTime = m.recordFrame / compData.fps;
-            // Davinci has no 0-frame markers; its 1-frame markers are AE's 0-duration ones.
+            // DaVinci has no 0-frame markers; its 1-frame markers map to AE's 0-duration ones.
             var duration = m.duration <= 1 ? 0 : m.duration / compData.fps;
 
-            var myMarker = new MarkerValue(m.name + "\n" + m.note);  // \n here for some reason \r only works one way
+            // \n separates name and note in AE marker comments — \r is one-way only.
+            var myMarker = new MarkerValue(m.name + "\n" + m.note);
             myMarker.duration = duration;
             myMarker.label = m.color;
 
             markerProp.setValueAtTime(startTime, myMarker);
         }
-        alert((markers.length || 0) + " markers imported to " + activeComp.name);
+        alert((markers.length || 0) + " markers imported to '" + activeComp.name + "'.");
     }
 
     function exportMarkers() {

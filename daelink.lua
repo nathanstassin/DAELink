@@ -1,5 +1,5 @@
 --[[
-    DAELink | v0.96 Beta | © 2025-2026 Nathan Stassin
+    DAELink | v0.91 Beta | © 2025-2026 Nathan Stassin
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -14,25 +14,26 @@
     You should have received a copy of the GNU General Public License
     along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-    Description: Links timeline nests with compositions in AE via a GUI Window. 
-                 Automated render management and shared markers across programs. 
+    Description:  Links timeline nests with compositions in After Effects via a GUI window.
+                  Automated render management and shared markers across programs.
 
     Author:       Nathan Stassin  |  https://www.nathanstassin.com
 
-    Requirements: Davinci Resolve Studio V20 or later 
-                  OR Davinci Resolve Free 19.0.3
+    Requirements: DaVinci Resolve Studio V20 or later
+                  OR DaVinci Resolve Free 19.0.3
 
-    Intallation: Drag this file into the Utility Scripts folder on your computer
-                 Mac:/Users/Username/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility
-                 Windows: %APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility\
+    Installation: Drag this file into the Fusion Utility Scripts folder on your computer.
+                  Mac: ~/Library/Application Support/Blackmagic Design/DaVinci Resolve/Fusion/Scripts/Utility/
+                  Windows: %APPDATA%\Blackmagic Design\DaVinci Resolve\Support\Fusion\Scripts\Utility\
 
-    Privacy:    All data stored locally. 
-                No data is transmitted to external servers.
-                
+    Privacy:      All data stored locally. No data is transmitted to external servers.
+
     Version History:
-    - 0.9 Beta - 17/01/2026
-    - 0.95 Beta - 14/04/2026 - UI improvements
-    - 0.96 Beta - 23/04/2026 - Open AE Project button + live-link enforcement with AE side
+    - 0.9 Beta  - 17/01/2026 - Initial public beta (released as MotionBridge).
+    - 0.91 Beta - 04/05/2026 - Renamed from MotionBridge to DAELink.
+                               UI overhaul, schema versioning, auto-reconnect persistence,
+                               Open AE Project button, live-link enforcement with AE side,
+                               conditional A1 unmute on Refresh Render.
 ]]
 
 -- GLOBALS
@@ -58,7 +59,7 @@ do
 end
 
 _G.CONSTANTS = {
-    DAELINK_VERSION = 0.96,
+    DAELINK_VERSION = 0.91,
     SCHEMA_VERSION = 1,
     PLACEHOLDER_TL_NAME = "0_DAELinkPlaceholder",
     FOLDER_NAMES = {
@@ -384,7 +385,7 @@ function initialise(project_media_path, silent)
             return false
         end
 
-        alert("DAELink Project initialised!\n Connect to same folder from AE using DAELink panel.")
+        alert("DAELink project initialised.\n\nConnect to the same folder from After Effects using the DAELink panel.")
     else
         -- Accept legacy "motionbridge/" folder structure until v1 release
         if not directory_exists(paths.root) then
@@ -602,8 +603,8 @@ end
 function version_check(silent)
     local data = load_json_data(_G.json_path)
 
-    -- schemaVersion gates cross-script JSON compatibility. Pre-0.95 projects
-    -- have no schemaVersion field; treat them as schema 1.
+    -- schemaVersion gates cross-script JSON compatibility. Early-beta
+    -- projects have no schemaVersion field; treat them as schema 1.
     local saved_schema = data.schemaVersion or 1
     local script_schema = _G.CONSTANTS.SCHEMA_VERSION
 
@@ -628,9 +629,9 @@ function refresh_project_globals()
 end
 
 function update_project_fps()
-    -- Potential edge case:
-        -- User changes project frame rate in Davinci without updating json, sends aecomp, then loads with mismatching fps
-        -- Not currently an issue as Davinci doesn't allow project FPS changes once media imported 
+    -- Potential edge case: user changes project frame rate in DaVinci without updating JSON,
+    -- sends aecomp, then loads with mismatching fps. Not currently an issue — DaVinci doesn't
+    -- allow project FPS changes once media is imported.
     local data = load_json_data(_G.json_path)
     data["projectFPS"] = _G.project:GetSetting("timelineFrameRate")
     save_json_data(data)
