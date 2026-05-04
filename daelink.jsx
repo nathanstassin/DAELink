@@ -1179,24 +1179,76 @@ function DAELink(thisObj) {
             return false;
         }
 
-        try { jsonFile.encoding = "UTF-8"; } catch (e) {}
-        jsonFile.lineFeed = ($.os && $.os.indexOf("Windows") !== -1) ? "Windows" : "Unix";
-
-        if (!jsonFile.open('w')) {
-            alert("Unable to open JSON file for writing");
-            return false;
-        }
-
+        // Encode FIRST so a stringify error never reaches the file.
+        var jsonString;
         try {
-            var jsonString = JSON.stringify(data, null, 4);
-            jsonFile.write(jsonString + "\n");
+            jsonString = JSON.stringify(data, null, 4);
         } catch (e) {
-            alert("Error writing JSON: " + e.toString());
-            jsonFile.close();
+            alert("Error encoding JSON (file left untouched): " + e.toString());
+            return false;
+        }
+        if (typeof jsonString !== "string" || jsonString.length === 0) {
+            alert("Encoded JSON was empty (file left untouched).");
             return false;
         }
 
-        jsonFile.close();
+        // Write to a sibling .tmp, verify by re-parse, then swap over the original.
+        // This survives mid-write failures (eg. AE script permissions disabled, which
+        // previously caused open('w') to truncate the original then fail silently).
+        var tmpFile = new File(jsonFile.fsName + ".tmp");
+        try { tmpFile.encoding = "UTF-8"; } catch (e) {}
+        tmpFile.lineFeed = ($.os && $.os.indexOf("Windows") !== -1) ? "Windows" : "Unix";
+
+        if (!tmpFile.open('w')) {
+            alert("Unable to open JSON temp file for writing (original preserved).");
+            return false;
+        }
+        var writeOk;
+        try {
+            writeOk = tmpFile.write(jsonString + "\n");
+        } catch (e) {
+            tmpFile.close();
+            try { tmpFile.remove(); } catch (e2) {}
+            alert("Error writing JSON (original preserved): " + e.toString());
+            return false;
+        }
+        tmpFile.close();
+        if (!writeOk) {
+            try { tmpFile.remove(); } catch (e) {}
+            alert("Failed to write JSON temp file (original preserved).");
+            return false;
+        }
+
+        // Verify by re-reading + parsing the temp file before swapping.
+        try { tmpFile.encoding = "UTF-8"; } catch (e) {}
+        if (!tmpFile.open('r')) {
+            try { tmpFile.remove(); } catch (e) {}
+            alert("Failed to verify JSON temp file (original preserved).");
+            return false;
+        }
+        var roundtrip = tmpFile.read();
+        tmpFile.close();
+        try {
+            JSON.parse(roundtrip);
+        } catch (e) {
+            try { tmpFile.remove(); } catch (e2) {}
+            alert("JSON temp file is corrupt (original preserved): " + e.toString());
+            return false;
+        }
+
+        // Swap: remove original, rename tmp to original's name.
+        // File.rename takes only a leaf name and renames within the same folder.
+        var leafName = decodeURI(jsonFile.name);
+        if (jsonFile.exists) {
+            if (!jsonFile.remove()) {
+                alert("Could not remove original JSON to swap in update (a stale .tmp may remain).");
+                return false;
+            }
+        }
+        if (!tmpFile.rename(leafName)) {
+            alert("Could not rename JSON temp file into place. The latest data is in: " + tmpFile.fsName);
+            return false;
+        }
 
         if (successMessage) alert(successMessage);
         return true;
