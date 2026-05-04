@@ -811,24 +811,61 @@ function load_json_data(path)
 end
 
 function save_json_data(data)
-    local encoded, encode_err = nil, nil
-    local ok, result = pcall(function()
-        return json.encode(data)
-    end)
-
+    -- Encode FIRST so an encoder error never reaches the file.
+    local ok, encoded = pcall(function() return json.encode(data) end)
     if not ok then
-        print("Error encoding JSON: " .. tostring(result))
+        print("Error encoding JSON (file left untouched): " .. tostring(encoded))
+        return false
+    end
+    if type(encoded) ~= "string" or #encoded == 0 then
+        print("Encoded JSON was empty (file left untouched).")
         return false
     end
 
-    local file, err = io.open(_G.json_path , "w")
+    -- Write to a sibling .tmp, verify by re-parse, then atomically swap.
+    -- Survives mid-write failures (permissions revoked, disk full, etc).
+    local tmp_path = _G.json_path .. ".tmp"
+    local file, err = io.open(tmp_path, "w")
     if not file then
-        print("Error writing JSON file: " .. tostring(err))
+        print("Error opening JSON temp file (original preserved): " .. tostring(err))
+        return false
+    end
+    local write_ok, write_err = file:write(encoded)
+    file:close()
+    if not write_ok then
+        os.remove(tmp_path)
+        print("Error writing JSON temp file (original preserved): " .. tostring(write_err))
         return false
     end
 
-    file:write(result)
-    file:close()
+    -- Verify the temp file round-trips before swapping.
+    local verify_file, verify_err = io.open(tmp_path, "r")
+    if not verify_file then
+        os.remove(tmp_path)
+        print("Failed to verify JSON temp file (original preserved): " .. tostring(verify_err))
+        return false
+    end
+    local roundtrip = verify_file:read("*a")
+    verify_file:close()
+    local parse_ok = pcall(function() return json.decode(roundtrip) end)
+    if not parse_ok then
+        os.remove(tmp_path)
+        print("JSON temp file is corrupt (original preserved).")
+        return false
+    end
+
+    -- os.rename overwrites the target on Mac/Linux; on Windows it fails if the
+    -- target exists, so remove the original first there. Both paths preserve
+    -- the original until the temp file is known-good above.
+    if package.config:sub(1,1) == "\\" then
+        os.remove(_G.json_path)
+    end
+    local rename_ok, rename_err = os.rename(tmp_path, _G.json_path)
+    if not rename_ok then
+        print("Could not swap JSON temp file into place: " .. tostring(rename_err) ..
+              "\nLatest data is in: " .. tmp_path)
+        return false
+    end
     return true
 end
 
