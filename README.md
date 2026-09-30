@@ -47,13 +47,13 @@ DAELink is free and always will be. If you find it useful, consider supporting d
 
 ## License
 
-This project is licensed under the **GNU General Public License v3.0**.
+This project is licensed under the **GNU General Public License v3.0**. See the [LICENSE](LICENSE) file for details.
 
 ---
 
 <div align="center">
 
-**[Documentation](https://nathanstassin.com/daelink) • [Report Issue](https://github.com/nathanstassin/DAELink/issues)**
+**[Download](https://github.com/nathanstassin/DAELink/releases) • [Documentation](https://nathanstassin.com/daelink) • [Report Issue](https://github.com/nathanstassin/DAELink/issues)**
 
 Made by [Nathan Stassin](https://nathanstassin.com)
 
