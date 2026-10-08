@@ -3496,7 +3496,7 @@ function open_ae_project()
     if data then
         local ctx = resolve_context(data)
         if ctx and ctx.comp and ctx.comp.aeID then
-            open_ae_comp(ae_path, ctx.comp.aeID, ctx.comp.name, is_windows)
+            open_ae_comp(ae_path, ctx.comp.aeID, ctx.comp.name, is_windows, comp_frame_at_playhead(ctx))
             return
         end
     end
@@ -3545,8 +3545,56 @@ function run_jsx_in_ae(ae_path, jsx_source, is_windows, wait_seconds)
     return true
 end
 
+-- Where the playhead sits inside the linked comp, as a comp-relative frame (0 = comp start),
+-- or nil when it cannot be worked out. nil is never an error: the caller opens the comp
+-- without moving AE's time indicator.
+-- Both frame numbers come from Resolve's own drop-frame-aware space, so the subtraction is
+-- exact. get_playhead_frame() is the only reader of the playhead.
+function comp_frame_at_playhead(ctx)
+    local ok, frame = pcall(function()
+        if ctx.mode == "nested" then
+            -- Playhead is inside the nest timeline itself.
+            local playhead = get_playhead_frame(ctx.nested_timeline)
+            local start_frame = ctx.nested_timeline:GetStartFrame()
+            if not playhead or type(start_frame) ~= "number" then return nil end
+            return playhead - start_frame
+        end
+
+        -- Playhead is over the nest clip in a parent timeline. The clip may be trimmed at its
+        -- head, so the offset into the nest timeline is the head trim plus the distance
+        -- travelled along the clip.
+        local playhead = get_playhead_frame(ctx.parent_timeline)
+        local clip = ctx.parent_clip
+        if not playhead or not clip or not clip.GetLeftOffset then return nil end
+        local clip_start = clip:GetStart()
+        local left_offset = clip:GetLeftOffset()
+        if type(clip_start) ~= "number" or type(left_offset) ~= "number" then return nil end
+        return left_offset + (playhead - clip_start)
+    end)
+    if not ok or type(frame) ~= "number" then
+        print("DAELink: Could not work out the playhead position inside the comp, opening it without moving the time indicator.")
+        return nil
+    end
+    frame = math.floor(frame + 0.5)
+    if frame < 0 then frame = 0 end
+    return frame
+end
+
 -- Open the AE project and navigate to a specific comp by its AE item ID.
-function open_ae_comp(ae_path, ae_comp_id, comp_name, is_windows)
+-- comp_frame (optional) is the comp-relative frame to park AE's time indicator on.
+function open_ae_comp(ae_path, ae_comp_id, comp_name, is_windows, comp_frame)
+    -- Park the time indicator, clamped to the comp's last frame. Wrapped in try so a failure
+    -- here can never undo the navigation that already happened.
+    local sync_time = ""
+    if type(comp_frame) == "number" then
+        sync_time = '    try {\n'
+            .. '        var f = ' .. string.format("%d", comp_frame) .. ';\n'
+            .. '        var last = Math.round(comp.duration * comp.frameRate) - 1;\n'
+            .. '        if (f > last) f = last;\n'
+            .. '        if (f < 0) f = 0;\n'
+            .. '        comp.time = f / comp.frameRate;\n'
+            .. '    } catch (e2) {}\n'
+    end
     local jsx = 'var targetID = ' .. tostring(ae_comp_id) .. ';\n'
         .. 'var comp = null;\n'
         .. 'for (var i = 1; i <= app.project.numItems; i++) {\n'
@@ -3565,6 +3613,7 @@ function open_ae_comp(ae_path, ae_comp_id, comp_name, is_windows)
         .. '        // Select it in the Project panel as a fallback so the timeline can be opened manually.\n'
         .. '        comp.selected = true;\n'
         .. '    }\n'
+        .. sync_time
         .. '}\n'
 
     print("DAELink: Opening comp '" .. comp_name .. "' in After Effects...")
@@ -3869,6 +3918,10 @@ end
 -- GUI LAYOUT
 _G.ui = fu.UIManager
 _G.disp = bmd.UIDispatcher(ui)
+local AE_BUTTON_CSS = "QPushButton { background-color: #b8acf4; color: #000000; border: 1px solid #8f82d6; border-radius: 8px; padding: 0; }"
+    .. " QPushButton:hover { background-color: #cdc4f8; border: 2px solid #e6e0ff; }"
+    .. " QPushButton:pressed { background-color: #9a8de0; }"
+    .. " QPushButton:disabled { background-color: #4a4766; color: #8a8a8a; border: 1px solid #3a3850; }"
 local DIVIDER_CSS = "QLabel { background-color: rgba(90, 90, 90, 255); margin: 0; padding: 0; border: 0; }"
 
 local MainWindow = disp:AddWindow({
@@ -3921,7 +3974,7 @@ local MainWindow = disp:AddWindow({
                 Weight = 0.8
             },
             ui:Button{ ID = "Browse", Text = _G.CONSTANTS.ICONS.openFolder, Weight = 0, MinimumSize = {30, 30}, MaximumSize = {30, 30}, ToolTip = "Re-select this project's daelink folder.\nUse if the folder has moved or you need to re-link." },
-            ui:Button{ ID = "OpenAE", Text = "AE", Weight = 0, MinimumSize = {30, 30}, MaximumSize = {30, 30}, ToolTip = "Opens the linked After Effects project.\nIf a DAELink nest is under the playhead, opens that comp directly.\nLaunches AE if no project is linked yet." }
+            ui:Button{ ID = "OpenAE", Text = "AE", Weight = 0, MinimumSize = {29, 29}, MaximumSize = {29, 29}, StyleSheet = AE_BUTTON_CSS, ToolTip = "Opens the linked After Effects project.\nIf a DAELink nest is under the playhead, opens that comp directly.\nLaunches AE if no project is linked yet." }
             }
         }
     }
