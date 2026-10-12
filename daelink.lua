@@ -2667,7 +2667,14 @@ function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_setti
         local content_offset = (earliest_start or placeholder_time_in_base_timeline) - placeholder_time_in_base_timeline
         if content_offset < 0 then content_offset = 0 end
 
-        if #layers_in_compound == 1 then
+        -- A lone still cannot take the raw-media path below. Resolve ignores the source range for
+        -- a still (it always lands at the default still length) and a still's range is 0 to 0, which
+        -- AppendToTimeline answers by adding nothing at all: the nest came out empty, and the nest
+        -- clip placed in the base timeline then had no content to play (a black freeze frame).
+        -- Measured on 21.1.1. A compound clip keeps the clip's exact timeline length at 100% speed,
+        -- so stills go down the compound path, the same one multi-layer placeholders use.
+        local lone_still = (#layers_in_compound == 1) and is_still_clip(layers_in_compound[1])
+        if #layers_in_compound == 1 and not lone_still then
             local timeline_clip = layers_in_compound[1]
             local mpi = timeline_clip:GetMediaPoolItem()
             local src_start = timeline_clip:GetSourceStartFrame()
@@ -2681,7 +2688,7 @@ function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_setti
                 recordFrame = content_offset
             }})
             _G.project:SetCurrentTimeline(base_timeline)
-        elseif #layers_in_compound > 1 then
+        elseif #layers_in_compound > 1 or lone_still then
             local compound_name = comp_name .. _G.CONSTANTS.LINKED_CLIPS_SUFFIX
             base_timeline:CreateCompoundClip(layers_in_compound, { name = compound_name })
             local compound_mpi = get_mpi_by_name(compound_name)
