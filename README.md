@@ -17,13 +17,13 @@ DAELink is a workflow automation tool that bridges the gap between Adobe After E
 
 ### Key Features
 
-- **Composition Linking:** Bidirectional links between AE comps and DaVinci timeline nests.
+- **Composition Linking:** Bidirectional links between AE comps and DaVinci timeline nests. Jump straight from a DaVinci timeline clip to the exact linked composition in After Effects.
 - **Marker Synchronisation:** Share editorial notes, animation timing marks, and comments between apps.
 - **Smart Render Management:** Render in one click from After Effects with templates, then refresh renders in DaVinci in one click.
 - **Layer Transfer:** Send video, audio, and image layers from DaVinci timelines to your AE project in a new comp.
-- **Live Link:** Jump straight from a DaVinci timeline clip to the exact linked composition in After Effects.
 - **Project Organisation:** Each project maintains its own `daelink` folder with auto-organised folders in apps and on disk.
 
+- **All files are local on your computer. No signup, no cloud, no hidden fees.**
 ---
 
 ## Requirements
