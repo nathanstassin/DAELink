@@ -127,6 +127,13 @@ function DAELink(thisObj) {
 
     (function(passedObj) {
         var myScriptPal = buildUI(passedObj);
+        // The regression suite (tools/test, dev-only) sets DAELINK_TEST before loading this
+        // file: the panel is built but never shown, and handed to the suite, which clicks its
+        // buttons directly. Unset in normal use, so this changes nothing for anyone else.
+        if ($.global.DAELINK_TEST) {
+            $.global.DAELINK_TEST.panel = myScriptPal;
+            return;
+        }
         if (myScriptPal instanceof Window) {
             myScriptPal.center();
             myScriptPal.show();
@@ -713,21 +720,292 @@ function DAELink(thisObj) {
 
             // Only set visual properties for video layers
             if (layerData.mediaType !== "audio") {
-                var xScaleMultiplier = 1;
-                var yScaleMultiplier = 1;
-                if (layerData.flipX === "true") { xScaleMultiplier = -1; }
-                if (layerData.flipY === "true") { yScaleMultiplier = -1; }
-                currentLayer.scale.setValue([layerData.zoomX * 100 * xScaleMultiplier, layerData.zoomY * 100 * yScaleMultiplier]);
-                currentLayer.opacity.setValue(layerData.opacity);
-                // AE and DaVinci rotate in opposing directions
-                currentLayer.rotation.setValue(-1 * layerData.rotationAngle);
-                // AE 0 position is top-left, DaVinci 0 position is centre
-                var xResOffset = 0.5 * compData.resolutionWidth;
-                var yResOffset = 0.5 * compData.resolutionHeight;
-                currentLayer.position.setValue([layerData.pan + xResOffset, -1 * layerData.tilt + yResOffset]);
-                // Anchor point intentionally not transferred - in DaVinci it only affects rotation pivot, not layer position.
+                applyDaVinciLook(currentLayer, layerData, importedItem, comp, compData, fps);
+                applyDaVinciBlendMode(currentLayer, layerData.compositeMode);
             }
         }
+    }
+
+    // A missing or unreadable value (JSON from before the field existed, "N/A") reads as fallback.
+    function numberOr(value, fallback) {
+        var n = Number(value);
+        return (value === null || value === undefined || value === "" || isNaN(n)) ? fallback : n;
+    }
+
+    // Everything below turns DaVinci's Inspector into AE layer properties, masks and effects.
+    // davinciState() reads one frame's Inspector values (keyframed or static), aeLook() converts
+    // them, and applyDaVinciLook() sets the result once, or at every frame when the clip has
+    // keyframes, so animated and static values go through exactly the same conversion.
+    // Every conversion was measured on Resolve 21.1.1 and is checked by rendering the same
+    // frame in both apps and comparing the pixels.
+
+    var LOOK_FIELDS = {
+        zoomX: 1, zoomY: 1, pan: 0, tilt: 0, rotationAngle: 0, anchorPointX: 0, anchorPointY: 0,
+        opacity: 100, cropLeft: 0, cropRight: 0, cropTop: 0, cropBottom: 0, cropSoftness: 0,
+        pitch: 0, yaw: 0, distortion: 0
+    };
+
+    // Inspector values at `frame` (counted from the layer's first frame). Keyframes come from
+    // DaVinci's OTIO export, which carries no easing, so they interpolate linearly and hold
+    // before the first and after the last.
+    function davinciState(layerData, frame) {
+        var st = {};
+        var keys = layerData.keyframes || {};
+        for (var field in LOOK_FIELDS) {
+            if (!LOOK_FIELDS.hasOwnProperty(field)) continue;
+            var k = keys[field];
+            if (k && k.length) {
+                if (frame <= k[0][0]) st[field] = k[0][1];
+                else if (frame >= k[k.length - 1][0]) st[field] = k[k.length - 1][1];
+                else {
+                    for (var i = 1; i < k.length; i++) {
+                        if (frame <= k[i][0]) {
+                            var f = (frame - k[i - 1][0]) / (k[i][0] - k[i - 1][0]);
+                            st[field] = k[i - 1][1] + (k[i][1] - k[i - 1][1]) * f;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                st[field] = numberOr(layerData[field], LOOK_FIELDS[field]);
+            }
+        }
+        return st;
+    }
+
+    // One frame's AE values. ctx: footage, fit [x, y], flip signs, comp centre.
+    //
+    // Scale: DaVinci fits footage to the timeline frame before Zoom (Input Scaling); AE places
+    // footage at native size, so the fit factor multiplies in. Flip is a negative scale.
+    // Rotation: opposite directions. Position: AE's origin is top-left, DaVinci's the centre.
+    // Anchor: DaVinci's is the pivot for zoom and rotation, in timeline pixels from the frame
+    // centre (Y up), and does not move the image by itself; AE's is in source pixels and lands
+    // on the position, so it is converted through the fit and the position moves with it.
+    // DaVinci flips about the image's own centre, so the anchor offset mirrors on a flipped axis.
+    //
+    // Crop: a rectangle mask in source pixels (DaVinci crops in timeline pixels of the fitted
+    // image, from the image's own edges, before flip, which a mask under AE's negative-scale
+    // flip reproduces). Crop Softness (-100..100) becomes the mask's feather and expansion:
+    // DaVinci's edge is 2.675 * |s| - 0.75 wide (10-90%), centred 2.72 * s - 0.8 outside the
+    // crop line for s > 0 and 2.08 * |s| - 2.2 inside it for s < 0; AE's feather is centred on
+    // the mask edge with a 10-90% width of 0.975 * feather, and expansion moves the edge exactly.
+    //
+    // Pitch/Yaw (-1.5..1.5): a perspective about the image centre, in coordinates normalised to
+    // -1..1 across the image (v down): (u, v) -> (u, v) / (1 - pitch * v + yaw * u), after crop,
+    // flip and distortion and before zoom and rotation. Corner Pin reproduces it exactly from
+    // the four corners. DaVinci flips first and AE last, so a flipped axis negates its term.
+    function aeLook(st, ctx) {
+        var w = ctx.footage.width, h = ctx.footage.height;
+        var fx = ctx.fit[0] || 1, fy = ctx.fit[1] || 1;
+        var ax = st.anchorPointX, ay = -st.anchorPointY;
+        var look = {
+            scale: [st.zoomX * 100 * fx * ctx.flipX, st.zoomY * 100 * fy * ctx.flipY],
+            rotation: -st.rotationAngle,
+            anchor: [0.5 * w + ctx.flipX * ax / fx, 0.5 * h + ctx.flipY * ay / fy],
+            position: [st.pan + ctx.centre[0] + ax, -st.tilt + ctx.centre[1] + ay],
+            opacity: st.opacity
+        };
+
+        var l = st.cropLeft / fx, r = st.cropRight / fx, t = st.cropTop / fy, b = st.cropBottom / fy;
+        var soft = st.cropSoftness;
+        var shape = new Shape();
+        shape.vertices = [[l, t], [w - r, t], [w - r, h - b], [l, h - b]];
+        shape.closed = true;
+        var width = soft ? Math.max(0, 2.675 * Math.abs(soft) - 0.75) : 0;
+        // No nested ternary here: ExtendScript read "s > 0 ? x : s < 0 ? y : 0" as
+        // "(s > 0 ? x : s) < 0 ? y : 0", which silently zeroed every positive softness.
+        var shift = 0;
+        if (soft > 0) shift = Math.max(0, 2.72 * soft - 0.8);
+        else if (soft < 0) shift = -Math.max(0, 2.08 * -soft - 2.2);
+        look.crop = { needed: l > 0 || r > 0 || t > 0 || b > 0 || soft !== 0, shape: shape,
+                      feather: [width / 0.975 / fx, width / 0.975 / fy], offset: shift / ((fx + fy) / 2) };
+
+        look.distortion = st.distortion ? distortionParams(st.distortion) : { fov: 0, scale: 1, reverse: false };
+        look.distortion.needed = st.distortion !== 0;
+
+        var p = st.pitch * ctx.flipY, y = st.yaw * ctx.flipX;
+        function corner(u, v) {
+            var k = 1 - p * v + y * u;
+            return [w / 2 + (u * w / 2) / k, h / 2 + (v * h / 2) / k];
+        }
+        look.pin = { needed: p !== 0 || y !== 0, corners: [corner(-1, -1), corner(1, -1), corner(-1, 1), corner(1, 1)] };
+        return look;
+    }
+
+    // Sets property `prop` from `values` (one per time in `times`), or once when not animated.
+    function setLook(prop, times, values) {
+        if (times) prop.setValuesAtTimes(times, values); else prop.setValue(values[0]);
+    }
+
+    function applyDaVinciLook(layer, layerData, footage, comp, compData, fps) {
+        var ctx = {
+            footage: footage,
+            fit: inputScaleFactors(layerData.inputScaling, footage, comp),
+            flipX: layerData.flipX === "true" ? -1 : 1,
+            flipY: layerData.flipY === "true" ? -1 : 1,
+            centre: [0.5 * compData.resolutionWidth, 0.5 * compData.resolutionHeight]
+        };
+        var animated = false;
+        for (var kf in (layerData.keyframes || {})) { if (layerData.keyframes.hasOwnProperty(kf)) animated = true; }
+
+        var looks = [], times = null;
+        if (animated) {
+            // Baked at every frame: several conversions (the perspective corners, the
+            // distortion table) are not linear, so keys only at DaVinci's keyframes would
+            // drift between them.
+            times = [];
+            var frames = Math.max(1, Math.round(numberOr(layerData.duration, 1)));
+            for (var f = 0; f < frames; f++) {
+                looks.push(aeLook(davinciState(layerData, f), ctx));
+                times.push((numberOr(layerData.recordFrame, 0) + f) / fps);
+            }
+        } else {
+            looks.push(aeLook(davinciState(layerData, 0), ctx));
+        }
+        function each(get) { var out = []; for (var i = 0; i < looks.length; i++) out.push(get(looks[i])); return out; }
+        function anyNeeds(part) { for (var i = 0; i < looks.length; i++) if (looks[i][part].needed) return true; return false; }
+
+        setLook(layer.scale, times, each(function (o) { return o.scale; }));
+        setLook(layer.rotation, times, each(function (o) { return o.rotation; }));
+        setLook(layer.anchorPoint, times, each(function (o) { return o.anchor; }));
+        setLook(layer.position, times, each(function (o) { return o.position; }));
+        setLook(layer.opacity, times, each(function (o) { return o.opacity; }));
+
+        if (anyNeeds("crop")) {
+            var mask = layer.property("ADBE Mask Parade").addProperty("ADBE Mask Atom");
+            mask.name = "DaVinci Crop";
+            mask.maskMode = MaskMode.ADD;
+            setLook(mask.property("ADBE Mask Shape"), times, each(function (o) { return o.crop.shape; }));
+            setLook(mask.property("ADBE Mask Feather"), times, each(function (o) { return o.crop.feather; }));
+            setLook(mask.property("ADBE Mask Offset"), times, each(function (o) { return o.crop.offset; }));
+        }
+        // Effect order mirrors DaVinci's: lens distortion, then pitch/yaw.
+        if (anyNeeds("distortion")) {
+            var first = looks[0].distortion;
+            var anyReverse = false;
+            for (var di = 0; di < looks.length; di++) if (looks[di].distortion.reverse) anyReverse = true;
+            addDistortionEffects(layer, footage, first.fov, first.scale, anyReverse);
+            var fxp = layer.property("ADBE Effect Parade");
+            var oc = fxp.property("DaVinci Distortion");
+            var tr = fxp.property("DaVinci Distortion Scale");
+            setLook(oc.property("ADBE Optics Compensation-0001"), times, each(function (o) { return o.distortion.fov; }));
+            setLook(oc.property("ADBE Optics Compensation-0002"), times, each(function (o) { return o.distortion.reverse ? 1 : 0; }));
+            setLook(tr.property("ADBE Geometry2-0003"), times, each(function (o) { return o.distortion.scale * 100; }));
+        }
+        if (anyNeeds("pin")) {
+            var pin = layer.property("ADBE Effect Parade").addProperty("ADBE Corner Pin");
+            pin.name = "DaVinci Pitch/Yaw";
+            for (var c = 0; c < 4; c++) {
+                (function (ci) {
+                    setLook(pin.property("ADBE Corner Pin-000" + (ci + 1)), times, each(function (o) { return o.pin.corners[ci]; }));
+                })(c);
+            }
+        }
+    }
+
+    // DaVinci's lens Distortion (-1..1) as AE's Optics Compensation followed by a uniform scale
+    // about the image centre (a Transform effect, so the scale cannot interfere with the layer's
+    // own anchor), clipped back to the image's rectangle as DaVinci's is. DaVinci's curve is not AE's, but for each value one FOV and one scale match it
+    // closely: positive values are a pincushion (Reverse Lens Distortion on), negative a barrel.
+    // DISTORTION_TABLE holds [FOV, scale] at -1.0, -0.95 ... 1.0, calibrated by rendering frames
+    // in both apps and maximising their PSNR (tools/debug/calibrate_distortion.py). The steps are
+    // 0.05 because DaVinci's curve does not interpolate linearly in FOV and scale: at 0.1 steps
+    // a value halfway between two entries was off by up to 8 px where the entries themselves
+    // were within 1 to 3.
+    var DISTORTION_TABLE = [
+        // -1.00 ... -0.05 (FOV Orientation vertical)
+        [118.0, 5.148], [106.5, 4.202], [101.0, 3.618], [96.2, 3.161], [93.0, 2.849],
+        [85.2, 2.519], [82.5, 2.304], [77.3, 2.108], [72.8, 1.945], [67.8, 1.803],
+        [63.5, 1.681], [58.9, 1.575], [54.2, 1.481], [49.6, 1.397], [44.6, 1.321],
+        [39.8, 1.254], [34.9, 1.193], [29.9, 1.139], [23.5, 1.087], [16.3, 1.042],
+        [0.0, 1.0],   // 0
+        // 0.05 ... 1.00 (Reverse Lens Distortion, FOV Orientation horizontal)
+        [9.2, 1.0], [25.0, 0.995], [45.9, 0.971], [58.4, 0.95], [67.6, 0.927],
+        [74.4, 0.905], [78.9, 0.888], [82.3, 0.871], [84.9, 0.857], [86.5, 0.849],
+        [87.7, 0.843], [88.7, 0.836], [89.5, 0.831], [90.2, 0.827], [90.6, 0.824],
+        [91.0, 0.821], [91.2, 0.82], [91.6, 0.816], [91.8, 0.815], [91.9, 0.815]
+    ];
+
+    function distortionParams(d) {
+        var x = (Math.max(-1, Math.min(1, d)) + 1) * 20;
+        var i = Math.min(39, Math.floor(x));
+        var f = x - i;
+        var a = DISTORTION_TABLE[i];
+        var b = DISTORTION_TABLE[i + 1];
+        // The middle entry is [0, 1], so neither side interpolates across the change of direction
+        return { fov: a[0] + (b[0] - a[0]) * f, scale: a[1] + (b[1] - a[1]) * f, reverse: d > 0 };
+    }
+
+    function addDistortionEffects(layer, footage, fov, scale, reverse) {
+        var fx = layer.property("ADBE Effect Parade");
+        var oc = fx.addProperty("ADBE Optics Compensation");
+        oc.name = "DaVinci Distortion";
+        oc.property("ADBE Optics Compensation-0001").setValue(fov);
+        oc.property("ADBE Optics Compensation-0002").setValue(reverse ? 1 : 0);
+        // FOV Orientation changes the shape of AE's curve, not just its strength. Measured at
+        // +0.3: Horizontal leaves 95% of the frame within 0.74 px of DaVinci's pincushion where
+        // Vertical leaves 4.5 px; Vertical already fits the barrel side within 0.3 px.
+        oc.property("ADBE Optics Compensation-0003").setValue(reverse ? 1 : 2);
+        // Resize lets a pincushion grow past the layer's bounds, as DaVinci's does. Max 4X, not
+        // Unlimited: at FOV 53 reversed, Unlimited never finishes rendering a frame (AE 2025).
+        if (reverse) oc.property("ADBE Optics Compensation-0006").setValue(3);
+        var tr = fx.addProperty("ADBE Geometry2");
+        tr.name = "DaVinci Distortion Scale";
+        tr.property("ADBE Geometry2-0001").setValue([footage.width / 2, footage.height / 2]);
+        tr.property("ADBE Geometry2-0002").setValue([footage.width / 2, footage.height / 2]);
+        tr.property("ADBE Geometry2-0003").setValue(scale * 100);
+        // DaVinci keeps the distorted image inside its original rectangle (straight edges,
+        // filled corners). Set Matte taking this layer's own source as the matte clips the
+        // result back to it; it reads the source, so effects do not move the matte, and it
+        // multiplies with the alpha already there, so a crop mask survives.
+        var clip = fx.addProperty("ADBE Set Matte3");
+        clip.name = "DaVinci Distortion Bounds";
+        clip.property("ADBE Set Matte3-0001").setValue(layer.index);
+    }
+
+    // DaVinci Composite Mode names (written by daelink.lua) to AE blending modes. Checked by
+    // rendering every mode in both apps (tools/debug/calibrate_blend_modes.py): on opaque
+    // pixels the first group matches within rounding. The approximate group uses different
+    // colour maths in DaVinci and only resembles AE's. DaVinci's alpha and luminance modes
+    // render as Normal for a clip over plain footage, so they map to Normal.
+    var BLEND_MODES = {
+        normal: "NORMAL", add: "ADD", subtract: "SUBTRACT", difference: "DIFFERENCE",
+        multiply: "MULTIPLY", screen: "SCREEN", overlay: "OVERLAY", hardLight: "HARD_LIGHT",
+        softLight: "SOFT_LIGHT", darken: "DARKEN", lighten: "LIGHTEN",
+        colorDodge: "CLASSIC_COLOR_DODGE", colorBurn: "CLASSIC_COLOR_BURN", exclusion: "EXCLUSION",
+        divide: "DIVIDE", linearDodge: "ADD", linearBurn: "LINEAR_BURN", linearLight: "LINEAR_LIGHT",
+        vividLight: "VIVID_LIGHT", pinLight: "PIN_LIGHT",
+        // approximate
+        hue: "HUE", saturation: "SATURATION", color: "COLOR", lumaMask: "LUMINOSITY",
+        // DaVinci's Lighter/Darker Color keep whichever whole pixel has the larger/smaller
+        // R+G+B sum (measured: 39 dB with that model); AE's compare luminance. Same operation,
+        // different brightness measure, so they agree wherever the two measures do.
+        hardMix: "HARD_MIX", lighterColor: "LIGHTER_COLOR", darkerColor: "DARKER_COLOR",
+        // render as Normal in DaVinci for a clip over footage
+        foreground: "NORMAL", alpha: "NORMAL", invertedAlpha: "NORMAL", luminosity: "NORMAL",
+        invertedLuminosity: "NORMAL"
+    };
+
+    function applyDaVinciBlendMode(layer, mode) {
+        if (!mode || mode === "normal") return;
+        var ae = BLEND_MODES[mode];
+        if (ae && BlendingMode[ae] !== undefined) layer.blendingMode = BlendingMode[ae];
+    }
+
+    // The scale DaVinci's Input Scaling applies to a source before Zoom, as [x, y] factors.
+    // mode is written per layer by the Lua side: "fit", "fill", "stretch" or "crop" (centre
+    // crop, no resizing). The source's displayed width includes its pixel aspect, the same
+    // width DaVinci fits. A missing mode (JSON from before this field existed) keeps the old
+    // behaviour, native size, so existing projects import exactly as they always did.
+    function inputScaleFactors(mode, footage, comp) {
+        if (!mode || mode === "crop" || !footage || !footage.width || !footage.height) return [1, 1];
+        var par = footage.pixelAspect || 1;
+        var fx = comp.width / (footage.width * par);
+        var fy = comp.height / footage.height;
+        if (mode === "fit") { var f = Math.min(fx, fy); return [f, f]; }
+        if (mode === "fill") { var g = Math.max(fx, fy); return [g, g]; }
+        if (mode === "stretch") return [fx, fy];
+        return [1, 1];
     }
 
     function findFoldersByName(name, parent) {

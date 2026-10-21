@@ -33,7 +33,9 @@
 ]]
 
 -- GLOBALS
-_G.resolve = app:GetResolve() or bmd.scriptapp("Resolve")
+-- `app` exists when Resolve runs this from the Workspace > Scripts menu, but not under the
+-- standalone fuscript interpreter the regression suite (tools/test) drives it from.
+_G.resolve = (app and app:GetResolve()) or bmd.scriptapp("Resolve")
 _G.project = nil
 _G.project_id = nil
 _G.media_pool = nil
@@ -93,6 +95,30 @@ _G.CONSTANTS = {
     PLACEHOLDER_DURATION = 5,  -- seconds
     FILE_DISPLAY_MAX_LENGTH = 90,
     PAGE_SIZE = 10,
+    -- Input Scaling ("mismatched resolution files"), mapped to the mode names daelink.jsx
+    -- understands. Measured on 21.1.1. Note the project string for fill is "scaleToCrop"
+    -- ("Scale full frame with crop"), which is easy to misread as the crop mode. The clip
+    -- Scaling property uses the resolve.SCALE_* integers; 0 means "use the project setting".
+    INPUT_SCALING = {
+        FROM_SETTING = { centerCrop = "crop", scaleToFit = "fit", scaleToCrop = "fill", stretch = "stretch" },
+        FROM_CLIP = { [0] = "project", [1] = "crop", [2] = "fit", [3] = "fill", [4] = "stretch" },
+    },
+    -- TimelineItem "CompositeMode" values, from the resolve.COMPOSITE_* constants (measured on
+    -- 21.1.1). Written to the JSON by name; daelink.jsx maps the names to AE blending modes.
+    COMPOSITE_MODES = {
+        [0] = "normal", [1] = "add", [2] = "subtract", [3] = "difference", [4] = "multiply",
+        [5] = "screen", [6] = "overlay", [7] = "hardLight", [8] = "softLight", [9] = "darken",
+        [10] = "lighten", [11] = "colorDodge", [12] = "colorBurn", [13] = "exclusion", [14] = "hue",
+        [15] = "saturation", [16] = "color", [17] = "lumaMask", [18] = "divide", [19] = "linearDodge",
+        [20] = "linearBurn", [21] = "linearLight", [22] = "vividLight", [23] = "pinLight",
+        [24] = "hardMix", [25] = "lighterColor", [26] = "darkerColor", [27] = "foreground",
+        [28] = "alpha", [29] = "invertedAlpha", [30] = "luminosity", [31] = "invertedLuminosity",
+    },
+    -- Modes whose AE counterpart is close but not exact (tools/debug/calibrate_blend_modes.py)
+    APPROXIMATE_COMPOSITE_MODES = {
+        hue = true, saturation = true, color = true, lumaMask = true, hardMix = true,
+        lighterColor = true, darkerColor = true,
+    },
     TIMECODE = {
         START = "00:00:00:00",
         PLACEHOLDER_END = "00:59:55:00"
@@ -319,7 +345,11 @@ function connect_to_project()
         if file_exists(paths.json) then
             -- Case 1: Path saved and valid - reconnect silently
             if connect_to_folder(saved_path, true) then return true end
-            -- Init failed despite valid path (e.g. version mismatch) - fall through to picker
+            -- The folder is there but connecting failed (a schema mismatch, a placeholder from
+            -- another project). Retry aloud so the user is told why, instead of opening the
+            -- picker: they would pick this same folder and only then hear the reason. A
+            -- different folder is one click away on the folder button.
+            return connect_to_folder(saved_path, false)
         else
             -- Case 2: Path saved but folder has moved - notify, then fall through to picker
             alert("DAELink project folder not found at:\n" .. saved_path .. "\n\nPlease navigate to its new location.")
@@ -480,10 +510,75 @@ function validate_placeholder(silent)
     return "valid"
 end
 
+-- Gives a timeline its own resolution. The switch is "useCustomSettings" (TimelineSettings in
+-- the API stub). DAELink used "UseCustomResolution" until 2026-10-17, which is not a setting:
+-- SetSetting returned false for it and for both dimensions after it, so every custom-size
+-- comp (a vertical comp from the New Composition dialog, or any AE comp linked at a size
+-- other than the project's) got a DaVinci timeline at the project resolution while AE was
+-- told the real size. Values must be strings; numbers are ignored too. Reads the result
+-- back, because SetSetting failing is silent.
+function set_timeline_resolution(timeline, width, height)
+    timeline:SetSetting("useCustomSettings", "1")
+    timeline:SetSetting("timelineResolutionWidth", tostring(width))
+    timeline:SetSetting("timelineResolutionHeight", tostring(height))
+    local w = tostring(timeline:GetSetting("timelineResolutionWidth"))
+    local h = tostring(timeline:GetSetting("timelineResolutionHeight"))
+    if w ~= tostring(width) or h ~= tostring(height) then
+        print("DAELink: Could not set '" .. tostring(timeline:GetName()) .. "' to " .. tostring(width) .. "x" ..
+              tostring(height) .. " (it is " .. w .. "x" .. h .. "). Please report this at nathanstassin.com/daelink.")
+        return false
+    end
+    return true
+end
+
+-- CreateEmptyTimeline occasionally returns nil (seen in roughly one regression-suite run in
+-- twenty, never on demand). Before retrying, look for the timeline by name: if the call did
+-- create it and only the reply was lost, a retry would make a second one or fail on the
+-- duplicate name. Prints whenever it had to step in, so a field report shows it happened.
+function create_empty_timeline(name)
+    for attempt = 1, 3 do
+        local tl = _G.media_pool:CreateEmptyTimeline(name)
+        if tl then
+            if attempt > 1 then print("DAELink: CreateEmptyTimeline('" .. name .. "') succeeded on attempt " .. attempt .. ".") end
+            return tl
+        end
+        for i = 1, _G.project:GetTimelineCount() do
+            local existing = _G.project:GetTimelineByIndex(i)
+            if existing and existing:GetName() == name then
+                print("DAELink: CreateEmptyTimeline('" .. name .. "') returned nothing but the timeline exists; using it.")
+                return existing
+            end
+        end
+        print("DAELink: CreateEmptyTimeline('" .. name .. "') returned nothing (attempt " .. attempt .. ").")
+        bmd.wait(0.2)
+    end
+    return nil
+end
+
+-- Moves the playhead and confirms it got there. Resolve answers true to SetCurrentTimecode
+-- even when the playhead stays put, which it does for a target past the end of the timeline
+-- unless the timeline view lets it (it usually does, measured 22 of 22, but the suite caught
+-- it failing about one run in twelve). Returns whether the playhead is at the target.
+function set_playhead_verified(timeline, timecode)
+    local fps = tonumber(timeline:GetSetting("timelineFrameRate"))
+    local drop = timeline_is_drop_frame(timeline)
+    local target = fps and timecode_to_frame(timecode, fps, drop)
+    for attempt = 1, 10 do
+        timeline:SetCurrentTimecode(timecode)
+        local now = timeline:GetCurrentTimecode()
+        if now == timecode or (target and fps and timecode_to_frame(now, fps, drop) == target) then
+            if attempt > 1 then print("DAELink: playhead reached " .. timecode .. " on attempt " .. attempt .. ".") end
+            return true
+        end
+        bmd.wait(0.1)
+    end
+    return false
+end
+
 function create_placeholder_timeline()
     _G.media_pool:SetCurrentFolder(_G.daelink_folder)
 
-    local tl = _G.media_pool:CreateEmptyTimeline(_G.CONSTANTS.PLACEHOLDER_TL_NAME)
+    local tl = create_empty_timeline(_G.CONSTANTS.PLACEHOLDER_TL_NAME)
     if not tl then
         alert("Failed to create DAELink placeholder timeline.")
         return false
@@ -492,8 +587,40 @@ function create_placeholder_timeline()
     tl:SetTrackEnable("video", 1, false) -- Hide null fusion comp
     tl:SetStartTimecode(_G.CONSTANTS.TIMECODE.START)
     tl:InsertFusionCompositionIntoTimeline()
-    tl:SetCurrentTimecode(_G.CONSTANTS.TIMECODE.PLACEHOLDER_END)
-    tl:InsertFusionCompositionIntoTimeline()
+    -- The second comp at PLACEHOLDER_END is what makes this timeline an hour long, which is
+    -- how far a user can stretch a placeholder in the edit. If it lands anywhere else (straight
+    -- after the first comp, at 10 s) placeholders in this project can only stretch that far.
+    --
+    -- Checking the playhead is not enough. Measured over 57 regression runs: the move missed
+    -- on the first try 23 times (a retry always fixed it), and 3 times GetCurrentTimecode
+    -- reported the target while the insert still landed at the old position. So the check
+    -- is on the result: where the comp actually is. A misplaced one is deleted and retried.
+    local fps = tonumber(tl:GetSetting("timelineFrameRate"))
+    local target = fps and timecode_to_frame(_G.CONSTANTS.TIMECODE.PLACEHOLDER_END, fps, timeline_is_drop_frame(tl))
+    local placed = false
+    for attempt = 1, 5 do
+        set_playhead_verified(tl, _G.CONSTANTS.TIMECODE.PLACEHOLDER_END)
+        local item = tl:InsertFusionCompositionIntoTimeline()
+        local start = item and item:GetStart()
+        if item and (not target or math.abs(start - target) < 1) then
+            if attempt > 1 then print("DAELink: placeholder timeline end placed on attempt " .. attempt .. ".") end
+            placed = true
+            break
+        end
+        print("DAELink: placeholder timeline end landed at frame " .. tostring(start) ..
+              " instead of " .. tostring(target) .. " (attempt " .. attempt .. "), retrying.")
+        -- Ripple, because a misplaced insert at the old playhead position (seen landing at 0)
+        -- pushed the first comp along by its length. Rippling the delete pulls it back to 0;
+        -- a plain delete left a gap at the head of the timeline.
+        if item then tl:DeleteClips({ item }, true) end
+        bmd.wait(0.2)
+    end
+    if not placed then
+        print("DAELink: Could not extend the placeholder timeline to " .. _G.CONSTANTS.TIMECODE.PLACEHOLDER_END ..
+              ". Placeholders in this project can only be stretched to 10 seconds. " ..
+              "Please report this at nathanstassin.com/daelink.")
+        tl:InsertFusionCompositionIntoTimeline()
+    end
 
 
     local timeline_item = get_timeline_mpi(tl)
@@ -1014,7 +1141,143 @@ function save_json_data(data)
     return true
 end
 
-function write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeholder, comp_name, resolutionHeight, resolutionWidth, fps, duration)
+-- DaVinci's Input Scaling for one clip, as the mode name the JSX side understands: "fit",
+-- "fill", "crop" (centre crop, no resizing) or "stretch". The clip's own Scaling property
+-- wins; SCALE_USE_PROJECT (the default) falls back to the timeline's setting, which itself
+-- reports the project's unless the timeline has custom settings. nil when unreadable, which
+-- the JSX treats as native size, the behaviour before this existed.
+-- base_timeline must be the edit the clip sits in, not whatever is current: by the time
+-- write_compdata_tojson runs, CreateEmptyTimeline has made the new nest current.
+-- Inspector keyframes. The scripting API cannot read them (GetProperty returns the static
+-- value at every playhead position, measured on 21.1.1), but Resolve's OTIO export carries
+-- every keyframed Inspector parameter, as { clip frame = value } counted from the clip's first
+-- frame on the timeline. This exports the timeline, finds each clip by track and record start,
+-- and returns, per clip, { field = { {frame, value}, ... } } in the units GetProperty uses.
+-- Positions and crops are stored as fractions of the timeline frame, hence the scale.
+local KEYFRAME_PARAMS = {
+    transformationZoomX = { "zoomX", 1 }, transformationZoomY = { "zoomY", 1 },
+    transformationPan = { "pan", "w" }, transformationTilt = { "tilt", "h" },
+    transformationRotationAngle = { "rotationAngle", 1 },
+    transformationPitch = { "pitch", 1 }, transformationYaw = { "yaw", 1 },
+    cropLeft = { "cropLeft", "w" }, cropRight = { "cropRight", "w" },
+    cropTop = { "cropTop", "h" }, cropBottom = { "cropBottom", "h" },
+    cropSoftness = { "cropSoftness", 1 }, opacity = { "opacity", 1 },
+    distortionParam = { "distortion", 1 },
+}
+
+function read_clip_keyframes(timeline)
+    local found = {}
+    if not (_G.resolve.EXPORT_OTIO and _G.project_media_path) then return found end
+    local path = build_project_paths(_G.project_media_path).support .. "/daelink_keyframes.otio"
+    local ok = pcall(function() return timeline:Export(path, _G.resolve.EXPORT_OTIO, _G.resolve.EXPORT_NONE) end)
+    local f = ok and io.open(path, "r")
+    if not f then
+        print("DAELink: Could not export the timeline to read keyframes; static values only.")
+        return found
+    end
+    local text = f:read("*a"); f:close(); os.remove(path)
+    local decoded, otio = pcall(json.decode, text)
+    if not decoded or type(otio) ~= "table" then
+        print("DAELink: Could not read the timeline's keyframes; static values only.")
+        return found
+    end
+
+    local w = tonumber(timeline:GetSetting("timelineResolutionWidth")) or 1920
+    local h = tonumber(timeline:GetSetting("timelineResolutionHeight")) or 1080
+    local scale = { w = w, h = h }
+    local function frames_of(range_part)
+        return range_part and tonumber(range_part.value) or 0
+    end
+
+    local counts = { Video = 0, Audio = 0 }
+    for _, track in ipairs((otio.tracks or {}).children or {}) do
+        local kind = track.kind
+        if counts[kind] then
+            counts[kind] = counts[kind] + 1
+            local position = 0
+            for _, item in ipairs(track.children or {}) do
+                local schema = tostring(item.OTIO_SCHEMA or "")
+                local length = frames_of(item.source_range and item.source_range.duration)
+                if schema:find("^Clip") then
+                    local keys = {}
+                    for _, effect in ipairs(item.effects or {}) do
+                        local meta = effect.metadata and effect.metadata.Resolve_OTIO
+                        for _, param in ipairs(meta and meta.Parameters or {}) do
+                            local id = param["Parameter ID"]
+                            local frames = param["Key Frames"]
+                            if frames and (KEYFRAME_PARAMS[id] or id == "transformationAnchorPoint") then
+                                local list = {}
+                                for frame, entry in pairs(frames) do
+                                    table.insert(list, { tonumber(frame), entry.Value })
+                                end
+                                table.sort(list, function(a, b) return a[1] < b[1] end)
+                                local function add(field, unit, pick)
+                                    local out, first, varies = {}, nil, false
+                                    for _, kv in ipairs(list) do
+                                        local v = pick(kv[2])
+                                        if type(v) == "number" then
+                                            v = v * (scale[unit] or unit)
+                                            if first == nil then first = v elseif math.abs(v - first) > 1e-9 then varies = true end
+                                            table.insert(out, { kv[1], v })
+                                        end
+                                    end
+                                    if varies then keys[field] = out end
+                                end
+                                if id == "transformationAnchorPoint" then
+                                    add("anchorPointX", "w", function(v) return type(v) == "table" and v[1] end)
+                                    add("anchorPointY", "h", function(v) return type(v) == "table" and v[2] end)
+                                else
+                                    add(KEYFRAME_PARAMS[id][1], KEYFRAME_PARAMS[id][2], function(v) return v end)
+                                end
+                            end
+                        end
+                    end
+                    if next(keys) then
+                        found[string.lower(kind) .. ":" .. counts[kind] .. ":" .. position] = keys
+                    end
+                end
+                if not schema:find("^Transition") then position = position + length end
+            end
+        end
+    end
+    return found
+end
+
+-- The keyframes read_clip_keyframes found for this clip, moved so frame 0 is the layer's first
+-- frame after any trim to the placeholder (`head` frames cut from the start).
+function keyframes_for_clip(all, clip, timeline, head)
+    local info = clip:GetTrackTypeAndIndex()
+    local key = info[1] .. ":" .. info[2] .. ":" .. math.floor(clip:GetStart() - timeline:GetStartFrame() + 0.5)
+    local keys = all[key]
+    if not keys then return nil end
+    local out = {}
+    for field, list in pairs(keys) do
+        out[field] = {}
+        for _, kv in ipairs(list) do table.insert(out[field], { kv[1] - head, kv[2] }) end
+    end
+    return out
+end
+
+function clip_input_scaling(clip, base_timeline)
+    local C = _G.CONSTANTS.INPUT_SCALING
+    local ok, clip_mode = pcall(function() return clip:GetProperty("Scaling") end)
+    if ok and clip_mode ~= nil then
+        local mapped = C.FROM_CLIP[tonumber(clip_mode)]
+        if mapped and mapped ~= "project" then return mapped end
+    end
+    local setting = base_timeline and base_timeline:GetSetting("timelineInputResMismatchBehavior")
+    if not setting or setting == "" then
+        setting = _G.project:GetSetting("timelineInputResMismatchBehavior")
+    end
+    local mapped = C.FROM_SETTING[tostring(setting)]
+    if not mapped then
+        print("DAELink: Unknown input scaling setting '" .. tostring(setting) .. "' for clip '" ..
+              tostring(clip:GetName()) .. "'; AE will place it at native size.")
+    end
+    return mapped
+end
+
+function write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeholder, comp_name, resolutionHeight, resolutionWidth, fps, duration, base_timeline)
     -- No "or {}" fallback here. Substituting an empty structure for an unreadable file
     -- would write this one comp over every existing link. load_json_data has already
     -- told the user why; abort so the file on disk is left exactly as it was.
@@ -1038,6 +1301,7 @@ function write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeh
     }
 
     local record_frame_offset = placeholder:GetStart(true)
+    local placeholder_duration = math.floor(placeholder:GetDuration(true))
 
     local filtered_linked = {}
     for _, clip in ipairs(linked_to_placeholder) do
@@ -1061,79 +1325,111 @@ function write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeh
         end
     end
 
+    local all_keyframes = read_clip_keyframes(base_timeline)
+
     for _, clip in ipairs(final_linked) do
-        local media_item = clip:GetMediaPoolItem()
-        local file_path = ""
-        if media_item then
-            local props = media_item:GetClipProperty()
-            if props and props["File Path"] then
-                file_path = props["File Path"]
+        -- Trimmed to the placeholder, which the user agreed to in replace_linked_with_aecomp.
+        -- AE places a layer at recordFrame - sourceStartFrame and shows recordFrame to
+        -- recordFrame + duration, so moving the head of all three keeps the media in sync.
+        local layer_record, layer_head, layer_duration = trim_to_placeholder(clip, record_frame_offset, placeholder_duration)
+        if layer_record then
+            local media_item = clip:GetMediaPoolItem()
+            local file_path = ""
+            if media_item then
+                local props = media_item:GetClipProperty()
+                if props and props["File Path"] then
+                    file_path = props["File Path"]
+                end
             end
-        end
 
-        -- A layer with no path can never import, and AE reports it as "File not found:"
-        -- with nothing after the colon, which reads like the file moved rather than like
-        -- DaVinci never supplied one. Say so here, where the clip that caused it is known.
-        if file_path == "" then
-            print(string.format("DAELink: No file path for clip '%s' (media pool item %s). It will be written to the JSON as a layer AE cannot import.",
-                tostring(clip:GetName()),
-                media_item and "found, but reports no File Path" or "missing"))
-        end
+            -- A layer with no path can never import, and AE reports it as "File not found:"
+            -- with nothing after the colon, which reads like the file moved rather than like
+            -- DaVinci never supplied one. Say so here, where the clip that caused it is known.
+            if file_path == "" then
+                print(string.format("DAELink: No file path for clip '%s' (media pool item %s). It will be written to the JSON as a layer AE cannot import.",
+                    tostring(clip:GetName()),
+                    media_item and "found, but reports no File Path" or "missing"))
+            end
 
-        local track_info = clip:GetTrackTypeAndIndex()
-        -- Reuse media_item from above rather than calling GetMediaPoolItem() again. The
-        -- empty-path branch prints a diagnostic and deliberately carries on, so the nil case
-        -- reaches here, and a second unchecked call turned that into a crash on the next
-        -- line. find_unimportable_clips() normally refuses these before we get here, but this
-        -- function is also reachable from other entry points.
-        local parLabel = media_item and media_item:GetClipProperty("PAR") or nil
-        local pixelAspectRatio = "N/A"
-        local flipX = "N/A"
-        local flipY = "N/A"
-        if track_info[1] == "video" then 
-            -- PAR needs the media pool item; the flips below come from the timeline clip and
-            -- do not, so an unreadable media item must not cost us those too.
-            if parLabel then
-                if parLabel ~= "Square" then 
-                    if confirm("Legacy pixel aspect ratio detected for clip: " .. clip:GetName() .. ". Change to square (recommended)?") then 
-                        media_item:SetClipProperty("PAR", "Square")
-                        parLabel = "Square"
-                    else 
-                        alert("Non-square pixel aspect ratios may not translate reliably to After Effects.\n" .. "Unless this clip is intentionally anamorphic or SD archival media, square pixels are recommended.")
+            local track_info = clip:GetTrackTypeAndIndex()
+            -- Reuse media_item from above rather than calling GetMediaPoolItem() again. The
+            -- empty-path branch prints a diagnostic and deliberately carries on, so the nil case
+            -- reaches here, and a second unchecked call turned that into a crash on the next
+            -- line. find_unimportable_clips() normally refuses these before we get here, but this
+            -- function is also reachable from other entry points.
+            local parLabel = media_item and media_item:GetClipProperty("PAR") or nil
+            local pixelAspectRatio = "N/A"
+            local flipX = "N/A"
+            local flipY = "N/A"
+            if track_info[1] == "video" then 
+                -- PAR needs the media pool item; the flips below come from the timeline clip and
+                -- do not, so an unreadable media item must not cost us those too.
+                if parLabel then
+                    if parLabel ~= "Square" then 
+                        if confirm("Legacy pixel aspect ratio detected for clip: " .. clip:GetName() .. ". Change to square (recommended)?") then 
+                            media_item:SetClipProperty("PAR", "Square")
+                            parLabel = "Square"
+                        else 
+                            alert("Non-square pixel aspect ratios may not translate reliably to After Effects.\n" .. "Unless this clip is intentionally anamorphic or SD archival media, square pixels are recommended.")
+                        end
+                    end
+
+                    pixelAspectRatio = _G.CONSTANTS.PAR_MAP[parLabel]
+
+                    if not pixelAspectRatio then
+                        pixelAspectRatio = tonumber(parLabel)
                     end
                 end
 
-                pixelAspectRatio = _G.CONSTANTS.PAR_MAP[parLabel]
-
-                if not pixelAspectRatio then
-                    pixelAspectRatio = tonumber(parLabel)
-                end
-            end
-
-            flipX = tostring(clip:GetProperty("FlipX"))
-            flipY = tostring(clip:GetProperty("FlipY"))
-        end 
+                flipX = tostring(clip:GetProperty("FlipX"))
+                flipY = tostring(clip:GetProperty("FlipY"))
+            end 
     
 
-        -- Known limitation: anchorpoints behave differently, so ommiting from layerData intentionally: AE (position + rotation) | Resolve (only rotation)
-        table.insert(comp_entry["layers"], {
-            layerName = clip:GetName(),
-            filePath = file_path,
-            mediaType = track_info[1],
-            trackIndex = track_info[2],
-            sourceStartFrame = clip:GetSourceStartFrame(),
-            recordFrame = clip:GetStart(true) - record_frame_offset,
-            duration = clip:GetDuration(true),
-            zoomX = clip:GetProperty("ZoomX") or "N/A",
-            zoomY = clip:GetProperty("ZoomY") or "N/A",
-            pan = clip:GetProperty("Pan") or "N/A",
-            tilt = clip:GetProperty("Tilt") or "N/A",
-            rotationAngle = clip:GetProperty("RotationAngle") or "N/A",
-            flipX = flipX, 
-            flipY = flipY, 
-            opacity = clip:GetProperty("Opacity") or "N/A",
-            pixelAspect = pixelAspectRatio
-        })
+            -- Anchor point and crop are in timeline pixels of the fitted image (measured on
+            -- 21.1.1). The anchor is the pivot for both zoom and rotation and does not move the
+            -- image by itself; crop is applied in source space, before flip. daelink.jsx turns
+            -- them into AE's anchor point, position and a mask. Crop softness, pitch, yaw,
+            -- distortion and composite mode travel as DaVinci's own values; the AE side holds
+            -- the measured conversions (applyDaVinciLook() and the helpers around it).
+            local is_video = track_info[1] == "video"
+            table.insert(comp_entry["layers"], {
+                layerName = clip:GetName(),
+                filePath = file_path,
+                mediaType = track_info[1],
+                trackIndex = track_info[2],
+                sourceStartFrame = clip:GetSourceStartFrame() + layer_head,
+                recordFrame = layer_record,
+                duration = layer_duration,
+                zoomX = clip:GetProperty("ZoomX") or "N/A",
+                zoomY = clip:GetProperty("ZoomY") or "N/A",
+                pan = clip:GetProperty("Pan") or "N/A",
+                tilt = clip:GetProperty("Tilt") or "N/A",
+                rotationAngle = clip:GetProperty("RotationAngle") or "N/A",
+                flipX = flipX, 
+                flipY = flipY, 
+                opacity = clip:GetProperty("Opacity") or "N/A",
+                anchorPointX = is_video and (clip:GetProperty("AnchorPointX") or 0) or nil,
+                anchorPointY = is_video and (clip:GetProperty("AnchorPointY") or 0) or nil,
+                cropLeft = is_video and (clip:GetProperty("CropLeft") or 0) or nil,
+                cropRight = is_video and (clip:GetProperty("CropRight") or 0) or nil,
+                cropTop = is_video and (clip:GetProperty("CropTop") or 0) or nil,
+                cropBottom = is_video and (clip:GetProperty("CropBottom") or 0) or nil,
+                cropSoftness = is_video and (clip:GetProperty("CropSoftness") or 0) or nil,
+                pitch = is_video and (clip:GetProperty("Pitch") or 0) or nil,
+                yaw = is_video and (clip:GetProperty("Yaw") or 0) or nil,
+                distortion = is_video and (clip:GetProperty("Distortion") or 0) or nil,
+                compositeMode = is_video and _G.CONSTANTS.COMPOSITE_MODES[tonumber(clip:GetProperty("CompositeMode")) or 0] or nil,
+                pixelAspect = pixelAspectRatio,
+                inputScaling = is_video and clip_input_scaling(clip, base_timeline) or nil,
+                keyframes = is_video and keyframes_for_clip(all_keyframes, clip, base_timeline, layer_head) or nil
+            })
+            local layer = comp_entry["layers"][#comp_entry["layers"]]
+            if layer.compositeMode and _G.CONSTANTS.APPROXIMATE_COMPOSITE_MODES[layer.compositeMode] then
+                print("DAELink: '" .. layer.layerName .. "' uses Composite Mode '" .. layer.compositeMode ..
+                      "', which After Effects can only approximate: DaVinci's colour maths for it differ.")
+            end
+        end
     end
 
     local markers = placeholder:GetMarkers()
@@ -1330,6 +1626,13 @@ function prompt_new_comp_dialog()
             end
             items.name.Text = cleaned
             name = cleaned
+        end
+
+        -- Refuse a taken name here, with the dialog still open, rather than after it closes
+        local problem = new_comp_name_problem(name)
+        if problem then
+            alert(problem)
+            return
         end
 
         local idx = items.preset.CurrentIndex + 1
@@ -1704,6 +2007,37 @@ function is_unique_timelinename(name)
     return true
 end
 
+-- The render file a comp name ends up as, reduced to what can collide on disk. Mirrors
+-- sanitizeFileName() in daelink.jsx, which turns dots into "-", and lower-cases because the
+-- default Mac and Windows file systems are case-insensitive: "Shot" and "shot", or "Shot.1"
+-- and "Shot-1", would render over each other and Refresh Render would hand one comp the
+-- other's render.
+function render_name_key(name)
+    local key = tostring(name or ""):gsub("%.", "-"):gsub("^%s+", ""):gsub("%s+$", "")
+    return key:lower()
+end
+
+-- Why `name` (already sanitised) cannot be used for a new comp, or nil when it can. Called by
+-- the New Composition dialog's OK button, so the user is told while the dialog is still
+-- open, and again by replace_linked_with_aecomp as the last check before anything changes.
+function new_comp_name_problem(name)
+    if not is_unique_timelinename(name) then
+        return "The timeline '" .. name .. "' already exists in this project. Choose another name."
+    end
+    local data = _G.json_path and file_exists(_G.json_path) and load_json_data(_G.json_path)
+    local key = render_name_key(name)
+    for _, comp in pairs(data and data.compositions or {}) do
+        if comp.name and render_name_key(comp.name) == key then
+            if comp.name == name then
+                return "A linked comp named '" .. name .. "' already exists. Choose another name."
+            end
+            return "'" .. name .. "' would render to the same file as the linked comp '" .. comp.name ..
+                   "'. Choose a name that differs by more than case or dots."
+        end
+    end
+    return nil
+end
+
 -- DROP-FRAME TIMECODE
 --
 -- Resolve's internal frame numbering is itself drop-frame aware, which is the fact all of this
@@ -1862,18 +2196,21 @@ function link_and_color_clips(timeline, video_clip, audio_clip, color)
 end
 
 -- CONTEXT-SPECIFIC OPERATIONS
+-- Returns the context, or nil and why: "no_context" when the playhead is on nothing linked
+-- (the buttons then explain where to stand), "handled" when the user has already been told
+-- (a refused or declined rename), so the buttons do not stack a second, wrong explanation.
 function resolve_context(data)
     local project = _G.project
     local current_timeline = project:GetCurrentTimeline()
     if not current_timeline then
         print("DAELink: Error: No current timeline.")
-        return nil
+        return nil, "no_context"
     end
 
     local item = get_timeline_mpi(current_timeline)
     if not item then
         print("DAELink: Error: No media pool item for current timeline.")
-        return nil
+        return nil, "no_context"
     end
 
     local current_id = item:GetMediaId()
@@ -1886,7 +2223,7 @@ function resolve_context(data)
             compositions[current_id],
             current_id
         )
-        if not updated_data then return nil end
+        if not updated_data then return nil, "handled" end
         delete_obsolete_nests(updated_data)
 
         return {
@@ -1905,26 +2242,26 @@ function resolve_context(data)
     local clip = current_timeline:GetCurrentVideoItem()
     if not clip then
         print("DAELink: No active clip selected in parent timeline.")
-        return nil
+        return nil, "no_context"
     end
 
     local clip_item = clip:GetMediaPoolItem()
     if not clip_item then
         print("DAELink: Error: Clip has no media pool item.")
-        return nil
+        return nil, "no_context"
     end
 
     local nested_id = clip_item:GetMediaId()
     local nested_timeline = get_timeline_byID(nested_id)
     if not nested_timeline then
         print("DAELink: Error: Could not find nested timeline for ID " .. tostring(nested_id))
-        return nil
+        return nil, "no_context"
     end
 
     local comp = compositions[nested_id]
     if not comp then
         print("DAELink: Error: No composition entry for nested timeline.")
-        return nil
+        return nil, "no_context"
     end
 
     local updated_data = sync_timeline_properties(
@@ -1932,7 +2269,7 @@ function resolve_context(data)
         comp,
         nested_id
     )
-    if not updated_data then return nil end
+    if not updated_data then return nil, "handled" end
     delete_obsolete_nests(updated_data)
 
     return {
@@ -2002,9 +2339,14 @@ function sync_timeline_properties(timeline, comp_data, comp_id)
 
         local data = load_json_data(_G.json_path)
         if not data then return nil end
+        -- Compared as render file names, the same test the New Composition dialog applies:
+        -- "shot" or "Shot.1" would render over an existing "Shot" or "Shot-1".
+        local key = render_name_key(current_name)
         for id, other_comp in pairs(data.compositions or {}) do
-            if id ~= comp_id and other_comp.name == current_name then
-                alert("Cannot use name '" .. current_name .. "' - another composition already uses this name.\n\nPlease rename timeline or resolve the conflict.")
+            if id ~= comp_id and other_comp.name and render_name_key(other_comp.name) == key then
+                local why = (other_comp.name == current_name) and "another composition already uses this name."
+                    or ("it would render to the same file as the composition '" .. other_comp.name .. "'.")
+                alert("Cannot use name '" .. current_name .. "' - " .. why .. "\n\nPlease rename timeline or resolve the conflict.")
                 return nil
             end
         end
@@ -2127,8 +2469,8 @@ function import_markers()
 
     local data = load_json_data(_G.json_path)
     if not data then return end
-    local ctx = resolve_context(data)
-    if not ctx then return end
+    local ctx, why = resolve_context(data)
+    if not ctx then return nil, why end
 
     save_json_data(ctx.updated_data)
 
@@ -2145,8 +2487,8 @@ function export_markers()
 
     local data = load_json_data(_G.json_path)
     if not data then return end
-    local ctx = resolve_context(data)
-    if not ctx then return end
+    local ctx, why = resolve_context(data)
+    if not ctx then return nil, why end
 
     local source_markers, source_name
     
@@ -2517,6 +2859,55 @@ function find_unimportable_clips(clips)
     return unimportable
 end
 
+-- The placeholder sets the comp length. Lists the linked clips that start before it or end
+-- after it, so the user can agree to have them trimmed before anything is created.
+-- Returns the list of descriptions, deduped by name for the same reason as
+-- find_retimed_clips (a clip's video and audio share one name).
+function find_clips_outside_placeholder(clips, ph_start, ph_end)
+    local outside = {}
+    local already_listed = {}
+    for _, clip in ipairs(clips or {}) do
+        local name = tostring(clip:GetName())
+        if name ~= _G.CONSTANTS.PLACEHOLDER_TL_NAME and not already_listed[name] then
+            local s, e = clip:GetStart(true), clip:GetEnd(true)
+            local note = nil
+            if e <= ph_start or s >= ph_end then
+                note = "entirely outside the placeholder, will be removed"
+            elseif s < ph_start and e > ph_end then
+                note = "past both ends"
+            elseif s < ph_start then
+                note = "starts " .. math.floor(ph_start - s + 0.5) .. " frames before"
+            elseif e > ph_end then
+                note = "ends " .. math.floor(e - ph_end + 0.5) .. " frames after"
+            end
+            if note then
+                already_listed[name] = true
+                table.insert(outside, name .. " (" .. note .. ")")
+            end
+        end
+    end
+    return outside
+end
+
+-- Clamps a linked clip to the placeholder's range. Returns the record offset inside the comp,
+-- how many frames are cut from the head, and the remaining length, or nil when nothing of
+-- the clip falls inside the placeholder.
+function trim_to_placeholder(clip, ph_start, ph_duration)
+    local record = clip:GetStart(true) - ph_start
+    local duration = clip:GetDuration(true)
+    local head = 0
+    if record < 0 then
+        head = -record
+        duration = duration - head
+        record = 0
+    end
+    if record + duration > ph_duration then
+        duration = ph_duration - record
+    end
+    if duration <= 0 then return nil end
+    return record, head, duration
+end
+
 function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_settings)
     if not require_initialisation() then return end
     get_daelink_folders()
@@ -2545,8 +2936,9 @@ function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_setti
         return
     end
 
-    if not is_unique_timelinename(comp_name) then
-        alert("Unable to Create Timeline - The timeline '" .. comp_name .. "' already exists in this project.")
+    local name_problem = new_comp_name_problem(comp_name)
+    if name_problem then
+        alert("Unable to create the composition. " .. name_problem)
         return
     end
 
@@ -2597,8 +2989,25 @@ function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_setti
         return
     end
 
+    -- The placeholder sets the comp length. Clips that run past either end are trimmed to it,
+    -- but only with the user's say-so, since the trimmed frames leave the edit. Declining
+    -- cancels before anything is created, like the checks above.
+    local outside_clips = find_clips_outside_placeholder(linked_to_placeholder, placeholder_time_in_base_timeline, placeholder_end_time)
+    if #outside_clips > 0 then
+        local trim = confirm("These clips linked to the placeholder run past its start or end:\n\n" ..
+              table.concat(outside_clips, "\n") ..
+              "\n\nThe placeholder sets the length of the comp, so the parts outside it cannot be included.\n\n" ..
+              "Trim these clips to the placeholder and create the comp?\n\n" ..
+              "Choose No to cancel and leave your edit unchanged. You can then resize the placeholder to cover them.")
+        if not trim then return end
+    end
+
     -- Create nested timeline
-    local nested_timeline = _G.media_pool:CreateEmptyTimeline(comp_name)
+    local nested_timeline = create_empty_timeline(comp_name)
+    if not nested_timeline then
+        alert("Could not create the timeline '" .. comp_name .. "'.\n\nNothing was changed. Please try again, and if it keeps happening, report it at nathanstassin.com/daelink.")
+        return
+    end
     local nested_timeline_mpi = get_timeline_mpi(nested_timeline)
     _G.media_pool:MoveClips({ nested_timeline_mpi }, _G.comps_folder)
     local nested_timeline_id = nested_timeline_mpi:GetMediaId()
@@ -2618,12 +3027,10 @@ function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_setti
     if use_custom_settings then
         resolutionHeight = custom_settings.customResolutionHeight
         resolutionWidth = custom_settings.customResolutionWidth
-        nested_timeline:SetSetting("UseCustomResolution", "1")
-        nested_timeline:SetSetting("timelineResolutionHeight", tostring(resolutionHeight))
-        nested_timeline:SetSetting("timelineResolutionWidth", tostring(resolutionWidth))
+        set_timeline_resolution(nested_timeline, resolutionWidth, resolutionHeight)
     end
 
-    write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeholder, comp_name, resolutionHeight, resolutionWidth, fps, placeholder_duration)
+    write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeholder, comp_name, resolutionHeight, resolutionWidth, fps, placeholder_duration, base_timeline)
 
     -- Transfer markers from placeholder to nested timeline
     local data = load_json_data(_G.json_path)
@@ -2656,16 +3063,21 @@ function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_setti
                 table.insert(layers_in_compound, clip)
             end
         end
-        -- Earliest linked-clip start (for placing the content at its offset relative to the placeholder)
-        local earliest_start = nil
+        -- Span of the linked content, for placing it inside the nest at its offset from the
+        -- placeholder. Anything outside the placeholder was agreed to be trimmed above, so the
+        -- span is cut to the placeholder rather than shifted: a clip starting before the
+        -- placeholder loses its head instead of sliding later in time.
+        local earliest_start, latest_end = nil, nil
         for _, c in ipairs(layers_in_compound) do
-            local s = c:GetStart(true)
-            if earliest_start == nil or s < earliest_start then
-                earliest_start = s
-            end
+            local s, e = c:GetStart(true), c:GetEnd(true)
+            if earliest_start == nil or s < earliest_start then earliest_start = s end
+            if latest_end == nil or e > latest_end then latest_end = e end
         end
-        local content_offset = (earliest_start or placeholder_time_in_base_timeline) - placeholder_time_in_base_timeline
-        if content_offset < 0 then content_offset = 0 end
+        earliest_start = earliest_start or placeholder_time_in_base_timeline
+        latest_end = latest_end or placeholder_end_time
+        local content_offset = math.max(earliest_start, placeholder_time_in_base_timeline) - placeholder_time_in_base_timeline
+        local content_head = math.max(0, placeholder_time_in_base_timeline - earliest_start)
+        local content_length = math.min(latest_end, placeholder_end_time) - math.max(earliest_start, placeholder_time_in_base_timeline)
 
         -- A lone still cannot take the raw-media path below. Resolve ignores the source range for
         -- a still (it always lands at the default still length) and a still's range is 0 to 0, which
@@ -2677,17 +3089,19 @@ function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_setti
         if #layers_in_compound == 1 and not lone_still then
             local timeline_clip = layers_in_compound[1]
             local mpi = timeline_clip:GetMediaPoolItem()
-            local src_start = timeline_clip:GetSourceStartFrame()
-            local src_end = timeline_clip:GetSourceEndFrame()
-            _G.project:SetCurrentTimeline(nested_timeline)
-            _G.media_pool:AppendToTimeline({{
-                mediaPoolItem = mpi,
-                startFrame = src_start,
-                endFrame = src_end,
-                trackIndex = 2,
-                recordFrame = content_offset
-            }})
-            _G.project:SetCurrentTimeline(base_timeline)
+            local record, head, length = trim_to_placeholder(timeline_clip, placeholder_time_in_base_timeline, placeholder_duration)
+            if record then
+                local src_start = timeline_clip:GetSourceStartFrame() + head
+                _G.project:SetCurrentTimeline(nested_timeline)
+                _G.media_pool:AppendToTimeline({{
+                    mediaPoolItem = mpi,
+                    startFrame = src_start,
+                    endFrame = src_start + length,
+                    trackIndex = 2,
+                    recordFrame = record
+                }})
+                _G.project:SetCurrentTimeline(base_timeline)
+            end
         elseif #layers_in_compound > 1 or lone_still then
             local compound_name = comp_name .. _G.CONSTANTS.LINKED_CLIPS_SUFFIX
             base_timeline:CreateCompoundClip(layers_in_compound, { name = compound_name })
@@ -2695,7 +3109,17 @@ function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_setti
             _G.media_pool:MoveClips({ compound_mpi }, _G.compound_clips_folder)
             if compound_mpi then
                 _G.project:SetCurrentTimeline(nested_timeline)
-                _G.media_pool:AppendToTimeline({{ mediaPoolItem = compound_mpi, trackIndex = 2, recordFrame = content_offset }})
+                -- A compound clip's source frames start at 0 at its earliest clip, so the
+                -- placeholder window is a plain sub-range of it (measured on 21.1.1).
+                if content_length > 0 then
+                    _G.media_pool:AppendToTimeline({{
+                        mediaPoolItem = compound_mpi,
+                        startFrame = content_head,
+                        endFrame = content_head + content_length,
+                        trackIndex = 2,
+                        recordFrame = content_offset
+                    }})
+                end
                 _G.project:SetCurrentTimeline(base_timeline)
                 
                 local compound_clip = base_timeline:GetCurrentVideoItem()
@@ -2731,9 +3155,15 @@ function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_setti
     end
 
     -- Append nested timeline to base timeline
+    -- An explicit range so the nest is exactly the placeholder's length, which is the comp
+    -- length AE is given. Without it the clip took the nested timeline's own length, so linked
+    -- content shorter or longer than the placeholder made the two apps disagree. A timeline
+    -- appended with a range longer than its content keeps the full range (measured on 21.1.1).
     local nest_clip = _G.media_pool:AppendToTimeline({ 
         { 
             mediaPoolItem = nested_timeline_mpi, 
+            startFrame = 0,
+            endFrame = placeholder_duration,
             trackIndex = final_track_index, 
             recordFrame = placeholder_time_in_base_timeline 
         } 
@@ -2809,19 +3239,14 @@ function import_new_comps()
         if entry then
             _G.media_pool:SetCurrentFolder(_G.comps_folder)
 
-            local new_timeline = _G.media_pool:CreateEmptyTimeline(entry.name)
+            local new_timeline = create_empty_timeline(entry.name)
             if not new_timeline then
                 print("DAELink: Skipping:", entry.name, "(could not create timeline)")
             else
                 local timeline_mpi = get_timeline_mpi(new_timeline)
-                -- tostring: SetSetting expects strings, and these arrive from the JSON as
-                -- numbers because the AE side writes activeComp.width / .height. Passing the
-                -- raw number is silently ignored, which left the comp at the project
-                -- resolution instead of its own. replace_linked_with_aecomp() has always
-                -- wrapped the same two calls.
-                new_timeline:SetSetting("UseCustomResolution", "1")
-                new_timeline:SetSetting("timelineResolutionHeight", tostring(entry.resolutionHeight))
-                new_timeline:SetSetting("timelineResolutionWidth", tostring(entry.resolutionWidth))
+                -- The AE comp's own size, which need not be the project's (a vertical comp).
+                -- See set_timeline_resolution() for why this used to silently fail.
+                set_timeline_resolution(new_timeline, entry.resolutionWidth, entry.resolutionHeight)
                 
                 local comp_start_frame = entry.compStartFrame
                 local comp_start_timecode = frame_to_timecode(
@@ -2970,8 +3395,8 @@ function refresh_render()
 
     local data = load_json_data(_G.json_path)
     if not data then return end
-    local ctx = resolve_context(data)
-    if not ctx then return end
+    local ctx, why = resolve_context(data)
+    if not ctx then return nil, why end
 
     save_json_data(ctx.updated_data)
 
@@ -3014,6 +3439,7 @@ function refresh_render_in_timeline(timeline, comp_data)
     local filename = render_path_base:match("([^/\\]+)$")
     if not filename then
         print("DAELink: Error: Could not extract filename from renderPath: " .. tostring(render_path_base))
+        alert("The render path saved for this composition could not be read: " .. tostring(render_path_base) .. "\n\nRender it again from After Effects.")
         return false
     end
 
@@ -3064,6 +3490,8 @@ function refresh_render_in_timeline(timeline, comp_data)
     local imported = _G.media_pool:ImportMedia({ render_path })
     if not imported or #imported == 0 then
         print("DAELink: Error: Failed to import render " .. render_path)
+        _G.media_pool:SetCurrentFolder(initial_folder)
+        alert("DaVinci could not import the render:\n" .. render_path .. "\n\nCheck that the file plays, or render it again from After Effects.")
         return false
     end
 
@@ -3078,6 +3506,14 @@ function refresh_render_in_timeline(timeline, comp_data)
     local audio_clip_data = { mediaPoolItem = imported[1], startFrame = 0, endFrame = comp_data["duration"], mediaType = 2, trackIndex = 1, recordFrame = 0 }
     local appended_video = _G.media_pool:AppendToTimeline({video_clip_data})
     local appended_audio = _G.media_pool:AppendToTimeline({audio_clip_data})
+
+    -- Two separate appends leave the render's video and audio unlinked, so moving one in the
+    -- nest would leave the other behind. Link them while the tracks are still unlocked.
+    if appended_video and appended_video[1] and appended_audio and appended_audio[1] then
+        if not timeline:SetClipsLinked({appended_video[1], appended_audio[1]}, true) then
+            print("DAELink: Warning: Could not link the render's video and audio in the nest.")
+        end
+    end
 
     set_a1_v1_tracks_locked(timeline, true)
 
@@ -3094,6 +3530,8 @@ function refresh_render_in_timeline(timeline, comp_data)
     end
 
     print("DAELink: Error: Failed to append render to timeline.")
+    _G.media_pool:SetCurrentFolder(initial_folder)
+    alert("The render was imported but could not be placed in the nest.\n\nThe Fusion console has the details, please include them in a bug report at nathanstassin.com/daelink.")
     return false
 end
 
@@ -3102,8 +3540,8 @@ function replace_render_after_refresh()
 
     local data = load_json_data(_G.json_path)
     if not data then return end
-    local ctx = resolve_context(data)
-    if not ctx then return end
+    local ctx, why = resolve_context(data)
+    if not ctx then return nil, why end
 
     local timeline = ctx.active_timeline
     local parent_timeline = ctx.parent_timeline
@@ -3737,6 +4175,10 @@ function run_jsx_in_ae_mac(ae_path, tmp_jsx)
     local applescript = [[
 set jsxFile to "]] .. tmp_jsx .. [["
 set aePath to "]] .. escaped_ae_path .. [["
+-- AE reports the path with symlinks resolved (/var/... arrives as /private/var/...), so both
+-- sides are compared as real paths. An exact compare never matched for a project reached
+-- through a symlink, and the wait below ran its full 30 s (measured: 34 s against 3 s).
+set aeReal to my realPath(aePath)
 
 -- Check if AE is already running (without launching it)
 tell application "System Events"
@@ -3746,17 +4188,7 @@ end tell
 set needsOpen to true
 if aeRunning then
     -- AE is running - check if the correct project is already open
-    try
-        tell application id "com.adobe.AfterEffects.application"
-            set checkFile to jsxFile & ".check"
-            set checkScript to "var f = app.project.file; var out = new File('" & checkFile & "'); out.open('w'); out.write(f ? f.fsName : ''); out.close();"
-            DoScript checkScript
-        end tell
-        set currentPath to do shell script "cat " & quoted form of (jsxFile & ".check") & " 2>/dev/null; rm -f " & quoted form of (jsxFile & ".check")
-        if currentPath is equal to aePath then
-            set needsOpen to false
-        end if
-    end try
+    if my realPath(my loadedProjectPath(jsxFile)) is equal to aeReal then set needsOpen to false
 end if
 
 if needsOpen then
@@ -3779,14 +4211,7 @@ if needsOpen then
     set maxAttempts to 30
     repeat maxAttempts times
         delay 1
-        try
-            tell application id "com.adobe.AfterEffects.application"
-                set result to DoScript "app.project.file && app.project.numItems > 0 ? app.project.file.fsName : ''"
-            end tell
-            if result is equal to aePath then
-                exit repeat
-            end if
-        end try
+        if my realPath(my loadedProjectPath(jsxFile)) is equal to aeReal then exit repeat
     end repeat
 end if
 
@@ -3797,6 +4222,34 @@ tell application id "com.adobe.AfterEffects.application"
     activate
     DoScriptFile jsxFile
 end tell
+
+-- The open project's path once it has items loaded, or "" for none, a project still loading,
+-- or AE not answering. DoScript returns 0 whatever the script evaluates to (measured on AE
+-- 2025), so the value has to come back through a file. Stage 2 used to compare DoScript's
+-- return value with the path, which never matched, so every click that had to open the
+-- project waited out all 30 attempts and users clicked again (roundtrip/17).
+on loadedProjectPath(jsxFile)
+    set checkFile to jsxFile & ".check"
+    try
+        tell application id "com.adobe.AfterEffects.application"
+            DoScript "var f = (app.project.file && app.project.numItems > 0) ? app.project.file.fsName : ''; var out = new File('" & checkFile & "'); out.open('w'); out.write(f); out.close();"
+        end tell
+        return do shell script "cat " & quoted form of checkFile & " 2>/dev/null; rm -f " & quoted form of checkFile
+    on error
+        return ""
+    end try
+end loadedProjectPath
+
+-- p with every symlink in its folder resolved, or p unchanged if that folder does not exist.
+-- "" stays "", so a project still loading never matches.
+on realPath(p)
+    if p is "" then return ""
+    try
+        return do shell script "p=" & quoted form of p & "; d=$(cd \"$(dirname \"$p\")\" 2>/dev/null && pwd -P) && printf '%s/%s' \"$d\" \"$(basename \"$p\")\" || printf '%s' \"$p\""
+    on error
+        return p
+    end try
+end realPath
 ]]
 
     local f = io.open(tmp_scpt, "w")
@@ -4078,29 +4531,32 @@ function handle_nest_linked_in_ae_comp(ev)
     if nested_timeline then push_new_comps_to_ae() end
 end
 
+-- The "where to stand" help is only for a playhead on nothing linked. Every other failure
+-- has already told the user what went wrong, and a second alert on top of it was wrong.
 function handle_import_markers(ev)
     if not connect_to_project() then return end
-    if not import_markers() then alert(get_context_help_message("markers")) end
+    local ok, why = import_markers()
+    if not ok and why == "no_context" then alert(get_context_help_message("markers")) end
 end
 
 function handle_export_markers(ev)
     if not connect_to_project() then return end
     update_project_fps()
-    local count, name = export_markers()
+    local count, name_or_why = export_markers()
     if not count then
-        alert(get_context_help_message("markers"))
+        if name_or_why == "no_context" then alert(get_context_help_message("markers")) end
     else
-        print("DAELink: " .. count .. " markers exported from nest: " .. name)
+        print("DAELink: " .. count .. " markers exported from nest: " .. name_or_why)
     end
 end
 
 function handle_refresh_render(ev)
     if not connect_to_project() then return end
     update_project_fps()
-    local refreshed = refresh_render()
+    local refreshed, why = refresh_render()
     if refreshed then 
         replace_render_after_refresh() 
-    else
+    elseif why == "no_context" then
         alert(get_context_help_message("refresh"))
     end
     
@@ -4149,7 +4605,13 @@ MainWindow.On.RefreshRender.Clicked = guarded("Refresh Render", handle_refresh_r
 MainWindow.On.OpenAE.Clicked = guarded("Open AE", handle_open_ae)
 
 -- Run
-MainWindow:RecalcLayout()
-MainWindow:Show()
-disp:RunLoop()
+-- The regression suite (tools/test, dev-only) sets DAELINK_TEST before loading this file, so
+-- every function and handler above is defined but the window never opens and RunLoop never
+-- blocks. The suite then calls the handle_* functions directly with its own dialog stubs.
+-- Unset in normal use, so this changes nothing for anyone running the script from Resolve.
+if not _G.DAELINK_TEST then
+    MainWindow:RecalcLayout()
+    MainWindow:Show()
+    disp:RunLoop()
+end
 MainWindow:Hide()
