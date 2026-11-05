@@ -401,7 +401,34 @@ function initialise(project_media_path, silent)
         -- First-time setup requires user interaction; abort silently during auto-reconnect
         if silent then return false end
 
-        if not confirm("No Link detected for current project: " .. _G.project:GetName() .. "\n\nInitialise link?") then
+        -- A missing placeholder does not mean a missing link. The user may have deleted the
+        -- placeholder timeline (it looks like clutter), or picked a folder that another
+        -- project already uses. Initialising wrote an empty daelink.json over either one,
+        -- and every link in it was lost with no backup, since the backup is only taken on a
+        -- load (review 2026-10-30, resolve/42 and 43). An existing file is never overwritten.
+        local existing = nil
+        if file_exists(local_json_path) then
+            existing = load_json_data(local_json_path)
+            -- Unreadable: load_json_data has already said why, and the file stays as it is
+            if not existing then return false end
+            if existing.projectid ~= _G.project_id then
+                alert("This daelink folder belongs to another DaVinci project:\n" .. paths.root ..
+                      "\n\nNothing was changed. Choose this project's own daelink folder, or an empty folder to start a new link.")
+                return false
+            end
+            -- The same schema check a reconnect makes, which this branch used to skip, linking an
+            -- incompatible file silently (review 2026-11-05, resolve/59)
+            local problem = schema_problem(existing)
+            if problem then
+                alert(problem)
+                return false
+            end
+            if not confirm("The DAELink placeholder timeline is missing from " .. _G.project:GetName() ..
+                           ", but its daelink folder and links are intact.\n\nRecreate the placeholder timeline? Existing links are kept.") then
+                alert("Nothing was changed.")
+                return false
+            end
+        elseif not confirm("No Link detected for current project: " .. _G.project:GetName() .. "\n\nInitialise link?") then
             alert("User cancelled link initialisation. Aborting.")
             return false
         end
@@ -422,12 +449,20 @@ function initialise(project_media_path, silent)
             return false
         end
 
-        if not initialise_json() then
-            _G.json_path = nil
-            return false
+        if existing then
+            -- load_and_validate_json() gives a reconnect the same default
+            if existing.compositions == nil then
+                existing.compositions = {}
+                save_json_data(existing)
+            end
+            alert("DAELink placeholder timeline recreated. Existing links are unchanged.")
+        else
+            if not initialise_json() then
+                _G.json_path = nil
+                return false
+            end
+            alert("DAELink project initialised.\n\nConnect to the same folder from After Effects using the DAELink panel.")
         end
-
-        alert("DAELink project initialised.\n\nConnect to the same folder from After Effects using the DAELink panel.")
     else
         if not directory_exists(paths.root) then
             notify(silent, "No daelink folder found!")
@@ -481,7 +516,7 @@ end
 
 function validate_placeholder(silent)
     -- Returns: "missing", "valid", or false (error)
-    local placeholder_timeline = get_mpi_by_name(_G.CONSTANTS.PLACEHOLDER_TL_NAME)
+    local placeholder_timeline = get_mpi_by_name(_G.CONSTANTS.PLACEHOLDER_TL_NAME, nil, "Timeline")
 
     if not placeholder_timeline then
         return "missing"
@@ -535,7 +570,17 @@ end
 -- twenty, never on demand). Before retrying, look for the timeline by name: if the call did
 -- create it and only the reply was lost, a retry would make a second one or fail on the
 -- duplicate name. Prints whenever it had to step in, so a field report shows it happened.
+--
+-- Only a timeline that did not exist before the first attempt may be adopted. CreateEmptyTimeline
+-- also returns nil for a name that is already taken, and adopting by name alone then handed the
+-- caller the user's own timeline: Import Linked Comps resized it, wiped its markers and recorded
+-- it as a nest (resolve/34).
 function create_empty_timeline(name)
+    local existed = {}
+    for i = 1, _G.project:GetTimelineCount() do
+        local t = _G.project:GetTimelineByIndex(i)
+        if t then existed[t:GetUniqueId()] = true end
+    end
     for attempt = 1, 3 do
         local tl = _G.media_pool:CreateEmptyTimeline(name)
         if tl then
@@ -544,7 +589,7 @@ function create_empty_timeline(name)
         end
         for i = 1, _G.project:GetTimelineCount() do
             local existing = _G.project:GetTimelineByIndex(i)
-            if existing and existing:GetName() == name then
+            if existing and existing:GetName() == name and not existed[existing:GetUniqueId()] then
                 print("DAELink: CreateEmptyTimeline('" .. name .. "') returned nothing but the timeline exists; using it.")
                 return existing
             end
@@ -624,6 +669,13 @@ function create_placeholder_timeline()
 
 
     local timeline_item = get_timeline_mpi(tl)
+    if not timeline_item then
+        -- Same flake class as CreateEmptyTimeline returning nil. Crashing here left an untagged
+        -- placeholder, and the next click blamed the user for deleting its comment (resolve/58).
+        print("DAELink: Could not find the timeline '" .. tl:GetName() .. "' in the media pool to tag it.")
+        alert("Could not tag the timeline '" .. tl:GetName() .. "' in the media pool. Delete it and try again.")
+        return false
+    end
     timeline_item:SetClipProperty("Comments", _G.CONSTANTS.COMMENT_ID_PREFIX .. _G.project_id)
     
     return true
@@ -690,7 +742,7 @@ function create_directory(path)
     if is_windows then
         cmd = string.format('mkdir "%s" 2>nul', path)
     else
-        cmd = string.format('mkdir -p "%s"', path)
+        cmd = 'mkdir -p ' .. shell_quote(path)
     end
     
     local ok = os.execute(cmd)
@@ -699,6 +751,14 @@ function create_directory(path)
         return false
     end
     return true
+end
+
+-- A path as one single-quoted word for sh, for every Mac command that takes one. Inside double
+-- quotes sh still expands $, backticks and backslashes: a media folder named "Client$2026" made
+-- mkdir create "Client026" and every render listing come back empty (review 2026-10-30).
+-- Windows commands keep their double quotes; cmd does not expand $.
+function shell_quote(s)
+    return "'" .. (tostring(s):gsub("'", "'\\''")) .. "'"
 end
 
 function directory_exists(path)
@@ -786,16 +846,26 @@ function version_check(silent)
     local data = load_json_data(_G.json_path)
     if not data then return false end
 
-    -- schemaVersion gates cross-script JSON compatibility. Early-beta
-    -- projects have no schemaVersion field; treat them as schema 1.
-    local saved_schema = data.schemaVersion or 1
-    local script_schema = _G.CONSTANTS.SCHEMA_VERSION
-
-    if saved_schema ~= script_schema then
-        notify(silent, "DAELink schema mismatch detected.\n\nProject schema: v" .. saved_schema .. "\nScript schema: v" .. script_schema .. "\n\nThe project was created by an incompatible version of DAELink. Please align script versions in both AE and Resolve.")
+    local problem = schema_problem(data)
+    if problem then
+        notify(silent, problem)
         return false
     end
     return true
+end
+
+-- The schema mismatch message for `data`, or nil when its schema is this script's. Shared by
+-- version_check() and the recreate-placeholder branch of initialise(), which skipped the check
+-- (resolve/59). schemaVersion gates cross-script JSON compatibility. Early-beta projects have
+-- no schemaVersion field; treat them as schema 1. Compared as a number, so a hand-edited "1"
+-- is not refused.
+function schema_problem(data)
+    local saved_schema = tonumber(data.schemaVersion or 1)
+    local script_schema = _G.CONSTANTS.SCHEMA_VERSION
+    if saved_schema ~= script_schema then
+        return "DAELink schema mismatch detected.\n\nProject schema: v" .. tostring(data.schemaVersion or 1) .. "\nScript schema: v" .. script_schema .. "\n\nThe project was created by an incompatible version of DAELink. Please align script versions in both AE and Resolve."
+    end
+    return nil
 end
 
 function refresh_project_globals()
@@ -817,7 +887,11 @@ function update_project_fps()
     -- allow project FPS changes once media is imported.
     local data = load_json_data(_G.json_path)
     if not data then return end
-    data["projectFPS"] = _G.project:GetSetting("timelineFrameRate")
+    local fps = _G.project:GetSetting("timelineFrameRate")
+    -- Most clicks call this, and the rate almost never changes. Writing anyway rewrote the file
+    -- on every click, which only widened the window for a clash with a save from AE.
+    if data["projectFPS"] ~= nil and not fps_differs(data["projectFPS"], fps) then return end
+    data["projectFPS"] = fps
     save_json_data(data)
 end
 
@@ -889,7 +963,12 @@ local json = (function()
   function json.encode(v)
     local t = type(v)
     if t == "nil" then return "null"
-    elseif t == "boolean" or t == "number" then return tostring(v)
+    elseif t == "boolean" then return tostring(v)
+    elseif t == "number" then
+      -- nan and inf are not JSON. Written raw, the verify step in save_json_data refused the
+      -- whole file and the save was lost; null is what AE's safeJSONStringify writes for them.
+      if v ~= v or v == math.huge or v == -math.huge then return "null" end
+      return tostring(v)
     elseif t == "string" then return '"' .. escape_str(v) .. '"'
     elseif t == "table" then
       local is_array = (#v > 0)
@@ -899,7 +978,7 @@ local json = (function()
         return "[" .. table.concat(result, ",") .. "]"
       else
         for k, val in pairs(v) do
-          table.insert(result, '"' .. tostring(k) .. '":' .. json.encode(val))
+          table.insert(result, '"' .. escape_str(tostring(k)) .. '":' .. json.encode(val))
         end
         return "{" .. table.concat(result, ",") .. "}"
       end
@@ -911,6 +990,9 @@ local json = (function()
     function json.decode(str)
     -- Very small recursive JSON parser (handles strings, numbers, arrays, objects, booleans, null)
     local pos = 1
+    -- A UTF-8 byte order mark is not part of the document. Editors on Windows add one, and
+    -- the parser read it as an unexpected character, refusing the whole file.
+    if str:sub(1, 3) == "\239\187\191" then pos = 4 end
     local function skip_ws()
         local _, np = str:find("^[ \n\r\t]*", pos)
         pos = np + 1
@@ -944,8 +1026,12 @@ local json = (function()
         local arr = {}
         skip_ws()
         if str:sub(pos, pos) == "]" then pos = pos + 1 return arr end
+        -- Counted, not #arr + 1: a null decodes as nil, and appending at #arr + 1 dropped it
+        -- and moved every later element down one place.
+        local n = 0
         while true do
-            arr[#arr + 1] = parse_value()
+            n = n + 1
+            arr[n] = parse_value()
             skip_ws()
             local c = str:sub(pos, pos)
             if c == "]" then pos = pos + 1 break end
@@ -958,6 +1044,10 @@ local json = (function()
         local s = {}
         while true do
             local c = str:sub(i, i)
+            -- Past the end of the text sub() returns "", which is neither a quote nor a
+            -- backslash, so a string cut off before its closing quote (a file truncated
+            -- mid-write) used to loop here forever and hang Resolve.
+            if c == "" then error("Unterminated string starting at position " .. pos) end
             if c == '"' then break end
             if c == "\\" then
             local n = str:sub(i + 1, i + 1)
@@ -1082,7 +1172,21 @@ function rotate_json_backup(path, content)
     print("DAELink: JSON backup written to " .. path .. ".bak")
 end
 
+-- Every save goes through here. A refused save used to print to the console only, and callers
+-- ignore the result, so the action looked done while the file never changed. The first failure
+-- in a session alerts; later ones print, so a broken folder cannot stack a modal on every click.
 function save_json_data(data)
+    local ok = write_json_file(data)
+    if not ok and not _G.json_save_failure_alerted then
+        _G.json_save_failure_alerted = true
+        alert("DAELink could not save daelink.json, so the last change was not recorded.\n\n" ..
+              "The Fusion console has the reason. Check that the project folder is writable and its drive has free space.\n\n" ..
+              "This message shows once per session. Later failures are printed to the console.")
+    end
+    return ok
+end
+
+function write_json_file(data)
     -- Encode FIRST so an encoder error never reaches the file.
     local ok, encoded = pcall(function() return json.encode(data) end)
     if not ok then
@@ -1096,7 +1200,12 @@ function save_json_data(data)
 
     -- Write to a sibling .tmp, verify by re-parse, then atomically swap.
     -- Survives mid-write failures (permissions revoked, disk full, etc).
-    local tmp_path = _G.json_path .. ".tmp"
+    -- Named for this side. AE writes daelink.json.ae.tmp: with one shared name, a save in each
+    -- app at the same moment (DaVinci's push lands in AE seconds after a DaVinci click) could
+    -- swap the other's half-written file into place and then fail its own rename, leaving no
+    -- daelink.json at all (review 2026-10-30).
+    local tmp_path = _G.json_path .. ".lua.tmp"
+    os.remove(tmp_path)
     local file, err = io.open(tmp_path, "w")
     if not file then
         print("DAELink: Error opening JSON temp file (original preserved): " .. tostring(err))
@@ -1126,18 +1235,23 @@ function save_json_data(data)
         return false
     end
 
-    -- os.rename overwrites the target on Mac/Linux; on Windows it fails if the
-    -- target exists, so remove the original first there. Both paths preserve
-    -- the original until the temp file is known-good above.
-    if package.config:sub(1,1) == "\\" then
-        os.remove(_G.json_path)
+    -- os.rename overwrites the target on Mac/Linux; on Windows it fails if the target exists.
+    -- There the original is moved aside rather than removed, so a failed rename can put it back
+    -- instead of leaving no daelink.json at all.
+    local is_windows = package.config:sub(1,1) == "\\"
+    local old_path = _G.json_path .. ".old"
+    if is_windows then
+        os.remove(old_path)
+        os.rename(_G.json_path, old_path)
     end
     local rename_ok, rename_err = os.rename(tmp_path, _G.json_path)
     if not rename_ok then
+        if is_windows and not file_exists(_G.json_path) then os.rename(old_path, _G.json_path) end
         print("DAELink: Could not swap JSON temp file into place: " .. tostring(rename_err) ..
               "\nLatest data is in: " .. tmp_path)
         return false
     end
+    if is_windows then os.remove(old_path) end
     return true
 end
 
@@ -1258,6 +1372,31 @@ function keyframes_for_clip(all, clip, timeline, head)
     return out
 end
 
+-- How many of the media's own frames one timeline frame spans: 1 when they share a rate.
+-- TimelineItem:GetSourceStartFrame() and AppendToTimeline's startFrame/endFrame count in the
+-- media's frames, while record positions, durations and trims count in the timeline's. Measured
+-- on 21.1.1 (2026-11-03): a 59.94 clip appended with source 100..200 on a 25 fps timeline lasts
+-- 41 timeline frames and reports GetSourceStartFrame() 100, for video and audio alike, while the
+-- OTIO export gives the same in-point as 41 at 25. A still reports the timeline's rate.
+-- The first image of an image sequence, from the File Path Resolve reports for it, or nil for
+-- anything else. Measured on 21.1.1 (2026-11-03): a sequence frame_0001.png .. frame_0025.png
+-- reports "/dir/frame_[0001-0025].png", which is not a file, so AE reported it missing. Its
+-- source frames count from 0 at the first image.
+function image_sequence_first_file(path)
+    local head, first, last, tail = tostring(path or ""):match("^(.*)%[(%d+)%-(%d+)%]([^/\\]*)$")
+    if not head then return nil end
+    return head .. first .. tail
+end
+
+function source_frames_per_timeline_frame(clip, timeline)
+    local ok, mpi = pcall(function() return clip:GetMediaPoolItem() end)
+    local source_fps = ok and mpi and tonumber(mpi:GetClipProperty("FPS"))
+    local timeline_fps = timeline and tonumber(timeline:GetSetting("timelineFrameRate"))
+    if not source_fps or not timeline_fps or source_fps <= 0 or timeline_fps <= 0 then return 1 end
+    if not fps_differs(source_fps, timeline_fps) then return 1 end
+    return source_fps / timeline_fps
+end
+
 function clip_input_scaling(clip, base_timeline)
     local C = _G.CONSTANTS.INPUT_SCALING
     local ok, clip_mode = pcall(function() return clip:GetProperty("Scaling") end)
@@ -1282,7 +1421,7 @@ function write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeh
     -- would write this one comp over every existing link. load_json_data has already
     -- told the user why; abort so the file on disk is left exactly as it was.
     local data = load_json_data(_G.json_path)
-    if not data then return false end
+    if not data then return false, "load" end
     if not data["compositions"] then
         data["compositions"] = {}
     end
@@ -1310,17 +1449,41 @@ function write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeh
         end
     end
 
-    -- Remove duplicate audio layers that share names with video items
-    local video_names = {}
+    -- An audio clip that is its video clip's own sound (same media, same timing) travels inside
+    -- that video layer, as AE plays a movie's audio with its picture. Any other audio clip is
+    -- its own layer. Matching by name alone dropped a J-cut's audio (it starts before its
+    -- picture) and AE then played the footage's sound locked to the picture instead
+    -- (review 2026-10-30, resolve/49). Each video layer records whether its sound came along
+    -- (withAudio), so AE can mute a picture whose audio the editor removed or moved.
+    local videos = {}
     for _, clip in ipairs(filtered_linked) do
-        if clip:GetTrackTypeAndIndex()[1] == "video" then
-            video_names[clip:GetName()] = true
-        end
+        if clip:GetTrackTypeAndIndex()[1] == "video" then table.insert(videos, clip) end
     end
+    local function media_id(clip)
+        local m = clip:GetMediaPoolItem()
+        return m and m:GetMediaId()
+    end
+    local function is_own_audio(video, audio)
+        local id = media_id(video)
+        if not id or id ~= media_id(audio) then return false end
+        return math.abs(video:GetStart() - audio:GetStart()) <= 1
+            and math.abs(video:GetDuration() - audio:GetDuration()) <= 1
+            and math.abs(video:GetSourceStartFrame() - audio:GetSourceStartFrame()) <= 1
+    end
+    local carries_audio = {}   -- video TimelineItem unique id -> true
     local final_linked = {}
     for _, clip in ipairs(filtered_linked) do
-        local track_type = clip:GetTrackTypeAndIndex()[1]
-        if not (track_type == "audio" and video_names[clip:GetName()]) then
+        if clip:GetTrackTypeAndIndex()[1] == "audio" then
+            local twin = nil
+            for _, v in ipairs(videos) do
+                if is_own_audio(v, clip) then twin = v break end
+            end
+            if twin then
+                carries_audio[twin:GetUniqueId()] = true
+            else
+                table.insert(final_linked, clip)
+            end
+        else
             table.insert(final_linked, clip)
         end
     end
@@ -1351,6 +1514,15 @@ function write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeh
                     media_item and "found, but reports no File Path" or "missing"))
             end
 
+            -- An image sequence travels as its first image, flagged, with its rate: AE imports
+            -- it as a sequence from there and would otherwise play it at its own default rate.
+            local sequence_fps = nil
+            local first_image = image_sequence_first_file(file_path)
+            if first_image then
+                file_path = first_image
+                sequence_fps = media_item and tonumber(media_item:GetClipProperty("FPS")) or nil
+            end
+
             local track_info = clip:GetTrackTypeAndIndex()
             -- Reuse media_item from above rather than calling GetMediaPoolItem() again. The
             -- empty-path branch prints a diagnostic and deliberately carries on, so the nil case
@@ -1379,6 +1551,13 @@ function write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeh
                     if not pixelAspectRatio then
                         pixelAspectRatio = tonumber(parLabel)
                     end
+                    -- Every label 21.1.1 accepts is in PAR_MAP (measured), so this is another
+                    -- version's label or a localised one. Square, and say so, rather than leave
+                    -- the field out for AE to guess at.
+                    if not pixelAspectRatio then
+                        print("DAELink: Unknown pixel aspect '" .. tostring(parLabel) .. "' on clip '" .. clip:GetName() .. "', sending it to AE as square.")
+                        pixelAspectRatio = 1
+                    end
                 end
 
                 flipX = tostring(clip:GetProperty("FlipX"))
@@ -1393,12 +1572,17 @@ function write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeh
             -- distortion and composite mode travel as DaVinci's own values; the AE side holds
             -- the measured conversions (applyDaVinciLook() and the helpers around it).
             local is_video = track_info[1] == "video"
+            local with_audio = nil
+            if is_video then with_audio = carries_audio[clip:GetUniqueId()] == true end
             table.insert(comp_entry["layers"], {
                 layerName = clip:GetName(),
                 filePath = file_path,
                 mediaType = track_info[1],
                 trackIndex = track_info[2],
-                sourceStartFrame = clip:GetSourceStartFrame() + layer_head,
+                -- In timeline frames, the unit AE divides by the comp rate. GetSourceStartFrame()
+                -- counts the media's own frames, so a 59.94 clip on a 25 timeline started its AE
+                -- layer 2.4 times too far into the media (review 2026-10-30, resolve/54).
+                sourceStartFrame = clip:GetSourceStartFrame() / source_frames_per_timeline_frame(clip, base_timeline) + layer_head,
                 recordFrame = layer_record,
                 duration = layer_duration,
                 zoomX = clip:GetProperty("ZoomX") or "N/A",
@@ -1421,6 +1605,9 @@ function write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeh
                 distortion = is_video and (clip:GetProperty("Distortion") or 0) or nil,
                 compositeMode = is_video and _G.CONSTANTS.COMPOSITE_MODES[tonumber(clip:GetProperty("CompositeMode")) or 0] or nil,
                 pixelAspect = pixelAspectRatio,
+                withAudio = with_audio,
+                imageSequence = first_image and true or nil,
+                sequenceFPS = sequence_fps,
                 inputScaling = is_video and clip_input_scaling(clip, base_timeline) or nil,
                 keyframes = is_video and keyframes_for_clip(all_keyframes, clip, base_timeline, layer_head) or nil
             })
@@ -1432,26 +1619,38 @@ function write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeh
         end
     end
 
+    -- Clip markers are keyed by media source frame (measured on 21.1.1), so a placeholder whose
+    -- head was trimmed in reported every marker that many frames late. The comp counts from the
+    -- placeholder's first visible frame (review 2026-10-30, resolve/47).
     local markers = placeholder:GetMarkers()
+    local marker_in = tonumber(placeholder:GetSourceStartFrame()) or 0
     if markers then
         for frame_id, marker_data in pairs(markers) do
-            local color_name = marker_data["color"] or ""
-            local color_index = get_marker_color_index(color_name)
-            table.insert(comp_entry["markers"], {
-                name = marker_data["name"] or "",
-                note = (marker_data["note"] or ""):gsub("\n", ""),
-                recordFrame = frame_id,
-                duration = marker_data["duration"] or 0,
-                color = color_index
-            })
+            local comp_frame = frame_id - marker_in
+            if comp_frame >= 0 and comp_frame < placeholder_duration then
+                local color_name = marker_data["color"] or ""
+                local color_index = get_marker_color_index(color_name)
+                table.insert(comp_entry["markers"], {
+                    name = marker_data["name"] or "",
+                    note = ((marker_data["note"] or ""):gsub("\n", "")),
+                    recordFrame = comp_frame,
+                    duration = marker_data["duration"] or 0,
+                    color = color_index
+                })
+            end
         end
     end
 
     data["compositions"][nested_timeline_id] = comp_entry
-    local ok = save_json_data(data)
+    -- write_json_file, not save_json_data: the caller alerts on failure with what it did and
+    -- did not change, and the once-per-session save alert on top would be a second modal for
+    -- the same failure.
+    local ok = write_json_file(data)
     if not ok then
         print("DAELink: Failed to write JSON data.")
+        return false, "save"
     end
+    return true
 end
 
 -- POPUP UTILITIES
@@ -1835,24 +2034,37 @@ function show_paginated_selection_dialog(config)
 end
 
 -- RESOLVE/PROJECT HELPERS
-function get_mpi_by_name(name, folder)
+-- The first media pool item named `name`. With `clip_type` ("Timeline", "Compound"; the Type
+-- clip property, measured on 21.1.1) an item of that type wins over any other of the same name,
+-- so a clip or compound sharing a timeline's name is not taken for it. The type is a preference
+-- rather than a filter because the label may be translated in a localised UI, and returning
+-- nothing there would be worse than the old first match.
+function get_mpi_by_name(name, folder, clip_type)
+    local first
+    local function walk(f)
+        for _, clip in ipairs(f:GetClipList() or {}) do
+            if clip:GetName() == name then
+                if not clip_type or clip:GetClipProperty("Type") == clip_type then return clip end
+                first = first or clip
+            end
+        end
+        for _, sub in ipairs(f:GetSubFolderList() or {}) do
+            local found = walk(sub)
+            if found then return found end
+        end
+    end
+    return walk(folder or _G.media_pool:GetRootFolder()) or first
+end
+
+-- Every media pool item named `name`, in any bin.
+function get_mpis_by_name(name, folder, out)
+    out = out or {}
     folder = folder or _G.media_pool:GetRootFolder()
-    local clips = folder:GetClipList()
-
-    for _, clip in ipairs(clips) do
-        if clip:GetName() == name then
-            return clip
-        end
+    for _, clip in ipairs(folder:GetClipList() or {}) do
+        if clip:GetName() == name then table.insert(out, clip) end
     end
-
-    for _, sub in ipairs(folder:GetSubFolderList()) do
-        local found = get_mpi_by_name(name, sub)
-        if found then
-            return found
-        end
-    end
-
-    return nil
+    for _, sub in ipairs(folder:GetSubFolderList() or {}) do get_mpis_by_name(name, sub, out) end
+    return out
 end
 
 function get_timeline_mpi(timeline)
@@ -1864,8 +2076,8 @@ function get_timeline_mpi(timeline)
         end
     end
     
-    -- Fallback for V19
-    return get_mpi_by_name(timeline:GetName())
+    -- Fallback for V19, by name, preferring a timeline over a clip that shares its name (resolve/39)
+    return get_mpi_by_name(timeline:GetName(), nil, "Timeline")
 end
 
 function get_timeline_byID(id)
@@ -2014,20 +2226,26 @@ end
 -- other's render.
 function render_name_key(name)
     local key = tostring(name or ""):gsub("%.", "-"):gsub("^%s+", ""):gsub("%s+$", "")
+    -- As sanitizeFileName() in daelink.jsx does to the file name: CON renders to CON-1, so its
+    -- key must be con-1 to collide with a comp already named CON-1 (unit/render_name_key)
+    if is_reserved_device_name(key) then key = key .. "-1" end
     return key:lower()
 end
 
 -- Why `name` (already sanitised) cannot be used for a new comp, or nil when it can. Called by
 -- the New Composition dialog's OK button, so the user is told while the dialog is still
--- open, and again by replace_linked_with_aecomp as the last check before anything changes.
-function new_comp_name_problem(name)
+-- open, again by replace_linked_with_aecomp as the last check before anything changes, and
+-- by import_new_comps for each comp linked from AE. That last caller passes the comp's own
+-- key as `own_key`, since its entry is already in the JSON and must not collide with itself,
+-- and `data` so the file is not reread for every entry.
+function new_comp_name_problem(name, own_key, data)
     if not is_unique_timelinename(name) then
         return "The timeline '" .. name .. "' already exists in this project. Choose another name."
     end
-    local data = _G.json_path and file_exists(_G.json_path) and load_json_data(_G.json_path)
+    data = data or (_G.json_path and file_exists(_G.json_path) and load_json_data(_G.json_path))
     local key = render_name_key(name)
-    for _, comp in pairs(data and data.compositions or {}) do
-        if comp.name and render_name_key(comp.name) == key then
+    for comp_key, comp in pairs(data and data.compositions or {}) do
+        if comp_key ~= own_key and comp.name and render_name_key(comp.name) == key then
             if comp.name == name then
                 return "A linked comp named '" .. name .. "' already exists. Choose another name."
             end
@@ -2180,8 +2398,11 @@ function get_or_make_top_track(timeline, track_type, start_frame, end_frame)
         return 1
     end
 
-    if not is_track_free(timeline, track_type, top_track, start_frame, end_frame) then
-        print("DAELink: Top track occupied, adding new " .. track_type .. " track")
+    -- A locked track takes no new clip, so the append placed nothing and the button looked
+    -- like it did nothing (review 2026-10-30, resolve/52). Treated like an occupied one.
+    local locked = timeline.GetIsTrackLocked and timeline:GetIsTrackLocked(track_type, top_track)
+    if locked or not is_track_free(timeline, track_type, top_track, start_frame, end_frame) then
+        print("DAELink: Top track " .. (locked and "locked" or "occupied") .. ", adding new " .. track_type .. " track")
         timeline:AddTrack(track_type)
         return track_count + 1
     end
@@ -2396,12 +2617,16 @@ function add_markers_to_target(target, markers)
     target:DeleteMarkersByColor("All")
     local count = 0
     for _, m in ipairs(markers) do
+        -- At least one frame. Written out, because the one-line and/or form gave nil for a
+        -- marker with no duration field (hand-edited or recovered JSON, resolve/60).
+        local duration = tonumber(m.duration) or 1
+        if duration < 1 then duration = 1 end
         if target:AddMarker(
             m.frame,
             m.color or "Blue",
             (m.name and m.name ~= "") and m.name or " ",
             m.note or "",
-            (tonumber(m.duration) or 1) < 1 and 1 or tonumber(m.duration)
+            duration
         ) then
             count = count + 1
         end
@@ -2423,6 +2648,9 @@ function add_markers_to_clip(clip)
     local source_markers = source_timeline:GetMarkers()
     if not source_markers then return end
 
+    -- AddMarker on a clip takes a media source frame, not a frame from the clip's visible start
+    -- (measured on 21.1.1), so a nest frame is passed through unchanged. Subtracting the in-point
+    -- put every marker early by the frames trimmed off the head (resolve/36).
     local in_frame = clip:GetSourceStartFrame()
     local out_frame = clip:GetSourceEndFrame()
 
@@ -2431,7 +2659,7 @@ function add_markers_to_clip(clip)
     for frame, data in pairs(source_markers) do
         if frame >= in_frame and frame <= out_frame then
             table.insert(markers, {
-                frame = frame - in_frame,
+                frame = frame,
                 color = data.color or "Blue",
                 name = data.name or "",
                 note = data.note or "",
@@ -2551,7 +2779,7 @@ function insert_placeholder_timeline_at_playhead()
 
     if _G.resolve:GetCurrentPage() == "media" then return false end
 
-    local placeholder_timeline = get_mpi_by_name(_G.CONSTANTS.PLACEHOLDER_TL_NAME)
+    local placeholder_timeline = get_mpi_by_name(_G.CONSTANTS.PLACEHOLDER_TL_NAME, nil, "Timeline")
     if not placeholder_timeline then
         print("DAELink: Error: 'DAELinkPlaceholder' not found in Media Pool.")
         return
@@ -2582,8 +2810,11 @@ function insert_placeholder_timeline_at_playhead()
     
     if appended and #appended > 0 then
         appended[1]:SetClipColor("Purple")
+        return true
     end
-    return true
+    -- Nothing placed. Returning true here showed nothing at all for a failed insert.
+    print("DAELink: AppendToTimeline placed no placeholder on video track " .. tostring(video_track_index) .. ".")
+    return false
 end
 
 function nested_timeline_has_audio(timeline)
@@ -2908,10 +3139,26 @@ function trim_to_placeholder(clip, ph_start, ph_duration)
     return record, head, duration
 end
 
+-- The video item on `timeline` made from media pool item `mpi` that overlaps start..end_frame,
+-- or nil. Used to find a compound clip just created in the edit without relying on the playhead.
+function find_timeline_item_of(timeline, mpi, start_frame, end_frame)
+    if not (timeline and mpi) then return nil end
+    local id = mpi:GetMediaId()
+    for i = 1, timeline:GetTrackCount("video") do
+        for _, it in ipairs(timeline:GetItemListInTrack("video", i) or {}) do
+            local m = it:GetMediaPoolItem()
+            if m and m:GetMediaId() == id and it:GetStart() < end_frame and it:GetEnd() > start_frame then
+                return it
+            end
+        end
+    end
+    return nil
+end
+
 function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_settings)
     if not require_initialisation() then return end
     get_daelink_folders()
-    local placeholder_timeline = get_mpi_by_name(_G.CONSTANTS.PLACEHOLDER_TL_NAME)
+    local placeholder_timeline = get_mpi_by_name(_G.CONSTANTS.PLACEHOLDER_TL_NAME, nil, "Timeline")
     if not comp_name or comp_name:match("^%s*$") then
         alert("Please enter a valid composition name.")
         return
@@ -2939,6 +3186,20 @@ function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_setti
     local name_problem = new_comp_name_problem(comp_name)
     if name_problem then
         alert("Unable to create the composition. " .. name_problem)
+        return
+    end
+
+    -- A new timeline takes the project's frame rate, and there is no measured way yet to give
+    -- it another one. A base timeline with its own rate (50 in a 25 project) got a nest at the
+    -- project rate, an AE comp at the base rate, and a nest clip of the wrong length, since the
+    -- placeholder's frame count was reused at the other rate (review 2026-10-30). Refused before
+    -- anything is created rather than built wrong.
+    local base_fps = base_timeline:GetSetting("timelineFrameRate")
+    local project_fps = _G.project:GetSetting("timelineFrameRate")
+    if fps_differs(base_fps, project_fps) then
+        alert("This timeline runs at " .. tostring(base_fps) .. " fps and the project at " .. tostring(project_fps) ..
+              " fps.\n\nDAELink can only make a comp from a timeline at the project's frame rate, so nothing was changed. " ..
+              "Copy the placeholder and its linked clips into a timeline at the project rate, or change the project rate.")
         return
     end
 
@@ -3009,6 +3270,11 @@ function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_setti
         return
     end
     local nested_timeline_mpi = get_timeline_mpi(nested_timeline)
+    if not nested_timeline_mpi then
+        print("DAELink: Could not find the timeline '" .. comp_name .. "' in the media pool.")
+        alert("Could not tag the timeline '" .. comp_name .. "' in the media pool. Delete it and try again.\n\nNothing in the edit was changed.")
+        return
+    end
     _G.media_pool:MoveClips({ nested_timeline_mpi }, _G.comps_folder)
     local nested_timeline_id = nested_timeline_mpi:GetMediaId()
     local resolutionHeight = base_timeline:GetSetting("timelineResolutionHeight")
@@ -3028,9 +3294,29 @@ function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_setti
         resolutionHeight = custom_settings.customResolutionHeight
         resolutionWidth = custom_settings.customResolutionWidth
         set_timeline_resolution(nested_timeline, resolutionWidth, resolutionHeight)
+    elseif tostring(resolutionWidth) ~= tostring(_G.project:GetSetting("timelineResolutionWidth")) or
+           tostring(resolutionHeight) ~= tostring(_G.project:GetSetting("timelineResolutionHeight")) then
+        -- "Match Project" means match the edit the placeholder is in. A new timeline takes the
+        -- project's size, so a 1080x1920 cutdown in a 1920x1080 project got a horizontal nest
+        -- while AE was told vertical, and the render came back fitted twice (resolve/46).
+        set_timeline_resolution(nested_timeline, resolutionWidth, resolutionHeight)
     end
 
-    write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeholder, comp_name, resolutionHeight, resolutionWidth, fps, placeholder_duration, base_timeline)
+    -- A link that is not in daelink.json is a nest no button can use ("No composition entry for
+    -- nested timeline"), so a refused save stops here, before anything in the edit changes, like
+    -- every check above. The empty nest timeline already exists and is left for the user: DAELink
+    -- does not delete timelines on its own (review 2026-11-05, resolve/57).
+    local saved, why = write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeholder, comp_name, resolutionHeight, resolutionWidth, fps, placeholder_duration, base_timeline)
+    if not saved then
+        _G.project:SetCurrentTimeline(base_timeline)
+        print("DAELink: Make AE Comp stopped before changing the edit; the empty timeline '" .. comp_name .. "' was created and can be deleted.")
+        if why == "save" then
+            alert("Could not save the link to daelink.json (see the console). Nothing in the edit was changed.\n\n" ..
+                  "The empty timeline '" .. comp_name .. "' was created and can be deleted; make the daelink folder writable and try again.")
+        end
+        -- why == "load": load_json_data() has already said why the file could not be read
+        return nil
+    end
 
     -- Transfer markers from placeholder to nested timeline
     local data = load_json_data(_G.json_path)
@@ -3091,12 +3377,24 @@ function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_setti
             local mpi = timeline_clip:GetMediaPoolItem()
             local record, head, length = trim_to_placeholder(timeline_clip, placeholder_time_in_base_timeline, placeholder_duration)
             if record then
-                local src_start = timeline_clip:GetSourceStartFrame() + head
+                -- Source frames, as AppendToTimeline counts them: the head trim and the length are
+                -- timeline frames and are converted for media at another rate (resolve/54).
+                local per = source_frames_per_timeline_frame(timeline_clip, base_timeline)
+                local src_start = math.floor(timeline_clip:GetSourceStartFrame() + head * per + 0.5)
+                -- Up, not to nearest: 41 timeline frames of 59.94 media is 98.3 source frames, and
+                -- 98 of them land one timeline frame short
+                local src_length = math.ceil(length * per - 1e-9)
+                -- Only the half the editor linked. Without mediaType the nest took everything the
+                -- file holds: camera audio deleted from b-roll came back, and an audio-only link
+                -- put that file's picture on V2 (review 2026-10-30, resolve/45). The nest has two
+                -- tracks of each kind, so track 2 exists for either.
+                local is_audio = timeline_clip:GetTrackTypeAndIndex()[1] == "audio"
                 _G.project:SetCurrentTimeline(nested_timeline)
                 _G.media_pool:AppendToTimeline({{
                     mediaPoolItem = mpi,
                     startFrame = src_start,
-                    endFrame = src_start + length,
+                    endFrame = src_start + src_length,
+                    mediaType = is_audio and 2 or 1,
                     trackIndex = 2,
                     recordFrame = record
                 }})
@@ -3104,9 +3402,21 @@ function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_setti
             end
         elseif #layers_in_compound > 1 or lone_still then
             local compound_name = comp_name .. _G.CONSTANTS.LINKED_CLIPS_SUFFIX
-            base_timeline:CreateCompoundClip(layers_in_compound, { name = compound_name })
-            local compound_mpi = get_mpi_by_name(compound_name)
-            _G.media_pool:MoveClips({ compound_mpi }, _G.compound_clips_folder)
+            -- Looking the new compound up by name found an older compound of the same name
+            -- first, and the new nest got that one's content (resolve/40). CreateCompoundClip
+            -- returns the new clip in isolation, but returns nil in this flow (measured on
+            -- 21.1.1, cause not found), so the fallback takes the item with this name that did
+            -- not exist before the call.
+            local existing = {}
+            for _, item in ipairs(get_mpis_by_name(compound_name)) do existing[item:GetMediaId()] = true end
+            local compound_item = base_timeline:CreateCompoundClip(layers_in_compound, { name = compound_name })
+            local compound_mpi = compound_item and compound_item:GetMediaPoolItem()
+            if not compound_mpi then
+                for _, item in ipairs(get_mpis_by_name(compound_name)) do
+                    if not existing[item:GetMediaId()] then compound_mpi = item break end
+                end
+            end
+            if compound_mpi then _G.media_pool:MoveClips({ compound_mpi }, _G.compound_clips_folder) end
             if compound_mpi then
                 _G.project:SetCurrentTimeline(nested_timeline)
                 -- A compound clip's source frames start at 0 at its earliest clip, so the
@@ -3122,7 +3432,12 @@ function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_setti
                 end
                 _G.project:SetCurrentTimeline(base_timeline)
                 
-                local compound_clip = base_timeline:GetCurrentVideoItem()
+                -- Found by its media pool item, never by the playhead. CreateCompoundClip returns
+                -- nil in this flow, and the playhead sits on the placeholder's first frame, so a
+                -- linked clip starting later left nothing under it: the compound and its audio
+                -- stayed in the edit underneath the new nest (review 2026-10-30, resolve/44).
+                local compound_clip = compound_item or
+                    find_timeline_item_of(base_timeline, compound_mpi, earliest_start, latest_end)
                 if compound_clip and compound_clip:GetName() == compound_name then
                     -- Built as a list rather than passed inline: a compound clip with no
                     -- audio returns an empty GetLinkedItems(), and { clip, nil } is a table
@@ -3138,6 +3453,29 @@ function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_setti
         for _, clip in ipairs(linked_to_placeholder) do
             base_timeline:DeleteClips({ clip }, false)
         end
+    end
+
+    -- Linked clips can all lie outside the placeholder (the user agreed to their removal), or a
+    -- compound can come out empty. The nest was then left with nothing in it, unlike the
+    -- nothing-linked case, which puts the placeholder inside. Same treatment here
+    -- (review 2026-10-30, resolve/53).
+    local nest_has_content = false
+    for _, kind in ipairs({ "video", "audio" }) do
+        for i = 1, nested_timeline:GetTrackCount(kind) do
+            if #(nested_timeline:GetItemListInTrack(kind, i) or {}) > 0 then nest_has_content = true end
+        end
+    end
+    if not nest_has_content then
+        _G.project:SetCurrentTimeline(nested_timeline)
+        _G.media_pool:AppendToTimeline({{
+            mediaPoolItem = placeholder_timeline,
+            startFrame = placeholder_startFrame,
+            endFrame = placeholder_endFrame,
+            mediaType = 1,
+            trackIndex = 2,
+            recordFrame = 0
+        }})
+        _G.project:SetCurrentTimeline(base_timeline)
     end
 
     local has_audio = nested_timeline_has_audio(nested_timeline)
@@ -3231,6 +3569,28 @@ function import_new_comps()
         return false
     end
 
+    -- Refuse a comp whose name is taken by a timeline or would render over a linked comp's
+    -- file, before anything is created. The Make AE Comp path has always applied this check;
+    -- this one never did, and a taken name used to take over the user's timeline (resolve/34).
+    -- A refused entry stays in the JSON, so a second click works once the clash is resolved.
+    table.sort(prelink_keys)
+    local accepted, refused = {}, {}
+    for _, key in ipairs(prelink_keys) do
+        local name = tostring(data.compositions[key].name or "")
+        local problem = new_comp_name_problem(name, key, data)
+        if problem then
+            table.insert(refused, "'" .. name .. "': " .. problem)
+        else
+            table.insert(accepted, key)
+        end
+    end
+    if #refused > 0 then
+        alert("These comps from After Effects were not imported:\n\n" .. table.concat(refused, "\n") ..
+              "\n\nRename the clashing timeline or comp in DaVinci, then click Import Linked Comps again.")
+    end
+    if #accepted == 0 then return false end
+    prelink_keys = accepted
+
     -- STEP 2: Process prelink entries and create timelines
     local created_timelines = {}
     
@@ -3240,10 +3600,15 @@ function import_new_comps()
             _G.media_pool:SetCurrentFolder(_G.comps_folder)
 
             local new_timeline = create_empty_timeline(entry.name)
+            local timeline_mpi = new_timeline and get_timeline_mpi(new_timeline)
             if not new_timeline then
                 print("DAELink: Skipping:", entry.name, "(could not create timeline)")
+            elseif not timeline_mpi then
+                -- Its media ID is the new key, so without the media pool item the comp cannot be
+                -- linked. Left as a prelink entry for the next Import Linked Comps.
+                print("DAELink: Skipping:", entry.name, "(timeline not found in the media pool)")
+                alert("Could not tag the timeline '" .. entry.name .. "' in the media pool. Delete it and try again.")
             else
-                local timeline_mpi = get_timeline_mpi(new_timeline)
                 -- The AE comp's own size, which need not be the project's (a vertical comp).
                 -- See set_timeline_resolution() for why this used to silently fail.
                 set_timeline_resolution(new_timeline, entry.resolutionWidth, entry.resolutionHeight)
@@ -3256,12 +3621,12 @@ function import_new_comps()
                 _G.project:SetCurrentTimeline(new_timeline)
 
                 -- Add render or placeholder
+                -- The placeholder also covers a renderPath with no file behind it (queued in AE but
+                -- not rendered, or deleted): the nest was left empty (resolve/41).
                 local render_path = entry.renderPath
-                if render_path then 
-                    refresh_render_in_timeline(new_timeline, entry)
-                else
+                if not (render_path and refresh_render_in_timeline(new_timeline, entry)) then
                     local placeholder_clip_data = {
-                        mediaPoolItem = get_mpi_by_name(_G.CONSTANTS.PLACEHOLDER_TL_NAME),
+                        mediaPoolItem = get_mpi_by_name(_G.CONSTANTS.PLACEHOLDER_TL_NAME, nil, "Timeline"),
                         startFrame = 0,
                         endFrame = entry.duration,
                         mediaType = 1,
@@ -3302,7 +3667,19 @@ function import_new_comps()
         data.compositions[tl_data.old_key] = nil
         data.compositions[tostring(tl_data.media_id)] = tl_data.entry
     end
-    save_json_data(data)
+    -- A refused save leaves the prelink keys in the file, and the next Import Linked Comps would
+    -- refuse every comp as "already exists" next to nests that were placed but never linked. So
+    -- nothing is placed (review 2026-11-05, resolve/61). write_json_file rather than
+    -- save_json_data, so this alert is the only one.
+    if not write_json_file(data) then
+        local names = {}
+        for _, tl_data in ipairs(created_timelines) do table.insert(names, "'" .. tl_data.entry.name .. "'") end
+        print("DAELink: Import Linked Comps stopped: daelink.json could not be saved.")
+        _G.project:SetCurrentTimeline(current_timeline)
+        alert("Could not save daelink.json (see the console). The timeline(s) " .. table.concat(names, ", ") ..
+              " were created but not placed or linked; delete them, make the daelink folder writable, and run Import Linked Comps again.")
+        return false
+    end
 
     -- STEP 4: Return to parent timeline and append created timelines
     _G.project:SetCurrentTimeline(current_timeline)
@@ -3418,11 +3795,11 @@ function refresh_render()
     -- Persist the renderFile that refresh_render_in_timeline just resolved
     save_json_data(ctx.updated_data)
 
+    -- No marker import afterwards: it replaced the markers on the nest and the nest clip from
+    -- the JSON, wiping any added in DaVinci and not exported (resolve/37). The clip keeps its
+    -- markers now, and the fallback rebuild in attach_nested_audio() copies them across.
     if ctx.parent_clip then
-        if attach_nested_audio(ctx.parent_timeline, ctx.parent_clip, ctx.active_timeline) then 
-            step_timeline_frames(ctx.parent_timeline, -1)
-            import_markers()
-        end
+        attach_nested_audio(ctx.parent_timeline, ctx.parent_clip, ctx.active_timeline)
     end
 
     return true
@@ -3462,14 +3839,17 @@ function refresh_render_in_timeline(timeline, comp_data)
         if is_windows then
             handle = io.popen('dir /b /o-d "' .. dir:gsub('/', '\\') .. '" 2>nul')
         else
-            handle = io.popen('ls -1t "' .. dir .. '" 2>/dev/null')
+            handle = io.popen('ls -1t ' .. shell_quote(dir) .. ' 2>/dev/null')
         end
 
         if not handle then return nil end
 
         -- Search through directory listing for matching basename
         for filename in handle:lines() do
-            if is_video_file(filename) and strip_video_extension(filename) == base then
+            -- Without case, as the default Mac and Windows disks match names: a comp renamed
+            -- from "Shot" to "shot" re-renders over Shot.mp4, which keeps its old spelling
+            -- (review 2026-10-30, resolve/50).
+            if is_video_file(filename) and strip_video_extension(filename):lower() == base:lower() then
                 handle:close()
                 return dir .. "/" .. filename
             end
@@ -3521,6 +3901,12 @@ function refresh_render_in_timeline(timeline, comp_data)
         timeline:SetTrackEnable("video", 2, false) -- Hide compound clip
         local render_has_audio = appended_audio and #appended_audio > 0
         timeline:SetTrackEnable("audio", 1, render_has_audio) -- Unmute A1 only when render carries audio
+        -- The linked clip's own audio sits on A2 (Make AE Comp puts it there). Mute it under a
+        -- render that carries audio, or both play at once; keep it as the fallback otherwise. A
+        -- nest made from a video-only link may have no A2, so only touch a track that exists.
+        if (timeline:GetTrackCount("audio") or 0) >= 2 then
+            timeline:SetTrackEnable("audio", 2, not render_has_audio)
+        end
         -- Log the file actually used, extension included. renderPath is extensionless (AE decides
         -- the container at render time), so this is the only record of what is currently linked.
         comp_data["renderFile"] = render_path
@@ -3552,8 +3938,10 @@ function replace_render_after_refresh()
         switched = true
     end
 
-    step_timeline_frames(timeline, -1)
-    local clip = timeline:GetCurrentVideoItem()
+    -- The render is the item on V1, read from the track. Stepping the playhead back a frame and
+    -- asking what is under it lost a race with the playhead move AppendToTimeline makes after
+    -- the render is placed, and the refresh was then skipped (review 2026-10-30).
+    local clip = (timeline:GetItemListInTrack("video", 1) or {})[1]
     if not clip then
         print("DAELink: No active video item to replace.")
     else
@@ -3612,17 +4000,73 @@ function attach_nested_audio(parent_timeline, parent_clip, nested_timeline)
         end
     end
 
-    -- Append audio + video from nested timeline (appending audio alone causes issues)
     local clip_start_frame = parent_clip:GetSourceStartFrame()
     local clip_duration = parent_clip:GetDuration(true)
     local record_frame = parent_clip:GetStart(true)
+    local nest_mpi = get_timeline_mpi(nested_timeline)
+    local audio_track_index = get_lowest_available_track(parent_timeline, "audio", record_frame, record_frame + clip_duration)
 
-    -- Video clip gets replaced in same track
+    -- Audio alone, linked to the clip already in the edit, so everything the editor did to that
+    -- clip (grade, Inspector, colour) stays. This used to rebuild the clip, because an audio-only
+    -- append once left the edit showing the previous render; measured on 21.1.1 it shows the new
+    -- one (resolve/35), with replace_render_after_refresh() refreshing the render inside the nest.
+    local appended = _G.media_pool:AppendToTimeline({{ mediaPoolItem = nest_mpi, startFrame = clip_start_frame,
+        endFrame = clip_start_frame + clip_duration, mediaType = 2, trackIndex = audio_track_index, recordFrame = record_frame }})
+    local audio = appended and appended[1]
+    if audio and parent_timeline:SetClipsLinked({ parent_clip, audio }, true) then
+        audio:SetClipColor(parent_clip:GetClipColor() or "Purple")
+        return true
+    end
+    if audio then parent_timeline:DeleteClips({ audio }) end
+
+    -- Fallback: rebuild the clip with its audio, then put back what the API can read. A grade
+    -- cannot be copied through the API, so say so rather than let it vanish unannounced.
+    print("DAELink: Could not attach the render's audio to the nest clip on its own; rebuilding the clip.")
+    local kept = {}
+    for _, key in ipairs(INSPECTOR_KEYS) do
+        local ok, v = pcall(function() return parent_clip:GetProperty(key) end)
+        if ok and v ~= nil then kept[key] = v end
+    end
+    local colour = parent_clip:GetClipColor()
+    local clip_markers = parent_clip:GetMarkers() or {}
     local video_track_index = parent_clip:GetTrackTypeAndIndex()[2]
     parent_timeline:DeleteClips({parent_clip})
-    local audio_track_index = get_lowest_available_track(parent_timeline, "audio", record_frame, record_frame + clip_duration)
-    append_and_link_mpi(parent_timeline, get_timeline_mpi(nested_timeline), clip_start_frame, clip_duration, video_track_index, audio_track_index, record_frame, "Purple")
+    local rebuilt = append_and_link_mpi(parent_timeline, nest_mpi, clip_start_frame, clip_duration, video_track_index, audio_track_index, record_frame, (colour ~= "" and colour) or "Purple")
+    if rebuilt then
+        for key, v in pairs(kept) do pcall(function() rebuilt:SetProperty(key, v) end) end
+        -- Same source range as the old clip, so its marker frames carry over unchanged
+        for frame, m in pairs(clip_markers) do
+            rebuilt:AddMarker(frame, m.color or "Blue", (m.name and m.name ~= "") and m.name or " ", m.note or "", m.duration or 1, m.customData or "")
+        end
+    end
+    print("DAELink: The nest clip '" .. tostring(nested_timeline:GetName()) .. "' was rebuilt to carry its audio. " ..
+          "Its Inspector settings and clip colour were restored, but any grade on it must be reapplied.")
     return true
+end
+
+-- Inspector properties copied across when attach_nested_audio() has to rebuild a nest clip.
+INSPECTOR_KEYS = {
+    "Pan", "Tilt", "ZoomX", "ZoomY", "ZoomGang", "RotationAngle", "AnchorPointX", "AnchorPointY",
+    "Pitch", "Yaw", "FlipX", "FlipY", "CropLeft", "CropRight", "CropTop", "CropBottom",
+    "CropSoftness", "CropRetain", "DynamicZoomEase", "CompositeMode", "Opacity", "Distortion",
+    "RetimeProcess", "MotionEstimation", "Scaling", "ResizeFilter",
+}
+
+-- Whether a media pool clip's File Path names the file at `target`. Both are reduced to forward
+-- slashes, single separators and lower case (Windows reports backslashes, and the default disks
+-- ignore case), and compared as plain text. The old comparison never matched a Windows path
+-- (backslashes) or a file:// one, so on Windows the render's clip stayed in the media pool,
+-- offline, after its file was deleted; and it used the path as a Lua pattern, where a dot
+-- matches any character (unit/same_media_path). A suffix still counts, for a clip path that
+-- arrives with a prefix such as /private, but only a whole absolute path.
+function same_media_path(clip_path, target)
+    local function norm(p)
+        p = tostring(p or ""):gsub("^file://", ""):gsub("\\", "/"):gsub("/+", "/")
+        return p:lower()
+    end
+    local a, b = norm(clip_path), norm(target)
+    if a == "" or b == "" then return false end
+    return a == b or (#a > #b and a:sub(-#b) == b and b:sub(1, 1) == "/")
 end
 
 function confirm_and_delete_unused_renders()
@@ -3663,13 +4107,8 @@ function confirm_and_delete_unused_renders()
     local deleted = {}
     
     local function delete_from_media_pool(folder, target_path)
-        local norm_target = target_path:gsub("//", "/"):lower()
-        
         for _, item in ipairs(folder:GetClipList()) do
-            local clip_path = (item:GetClipProperty("File Path") or "")
-            local norm_clip = clip_path:gsub("//", "/"):lower():gsub("^file://", "")
-            
-            if norm_clip == norm_target or norm_clip:match(norm_target .. "$") then
+            if same_media_path(item:GetClipProperty("File Path"), target_path) then
                 _G.media_pool:DeleteClips({item})
                 return true
             end
@@ -3711,9 +4150,10 @@ function append_and_link_mpi(parent_timeline, media_pool_item, clip_start_frame,
     local appended_audio = _G.media_pool:AppendToTimeline({audio_clip_data})
     if appended_video and appended_audio and #appended_video > 0 and #appended_audio > 0 then
         link_and_color_clips(parent_timeline, appended_video[1], appended_audio[1], clip_color)
-    else
-        print("DAELink: Error: Failed to append media pool item to timeline.")
+        return appended_video[1]
     end
+    print("DAELink: Error: Failed to append media pool item to timeline.")
+    return appended_video and appended_video[1] or nil
 end
 
 function delete_obsolete_nests(data)
@@ -3783,7 +4223,9 @@ function get_known_render_bases(data)
         if not path then return end
         local fname = path:match("([^/\\]+)$")
         local base = fname and strip_video_extension(fname) or ""
-        if base ~= "" then known_bases[base] = true end
+        -- Lower case, matched the same way in get_unused_render_files(): a render whose name
+        -- differs from renderPath only by case is the live one and must never be offered for deletion.
+        if base ~= "" then known_bases[base:lower()] = true end
     end
     for _, comp in pairs(data["compositions"]) do
         add(comp["renderPath"])
@@ -3808,7 +4250,7 @@ function get_unused_render_files(data)
     if is_windows then
         handle = io.popen('dir /b "' .. search_dir:gsub('/', '\\') .. '" 2>nul')
     else
-        handle = io.popen('ls -1 "' .. search_dir .. '" 2>/dev/null')
+        handle = io.popen('ls -1 ' .. shell_quote(search_dir) .. ' 2>/dev/null')
     end
     
     if not handle then
@@ -3824,7 +4266,7 @@ function get_unused_render_files(data)
             -- Keyed by basename, so a superseded render in a different container (comp.mov left
             -- beside a newer comp.mp4) still counts as "known" and is never offered for deletion.
             local base = strip_video_extension(file)
-            if not known_bases[base] then
+            if not known_bases[base:lower()] then
                 table.insert(unused_files, search_dir .. "/" .. file)
             end
         end
@@ -3950,7 +4392,7 @@ function open_ae_project()
         local native_path = ae_path:gsub("/", "\\")
         os.execute('cmd /c start "" "' .. native_path .. '"')
     else
-        os.execute('open "' .. ae_path .. '"')
+        os.execute('open ' .. shell_quote(ae_path))
     end
 end
 
@@ -3967,15 +4409,37 @@ end
 -- pending comps" one. Returns false only if the temp file could not be written, in which
 -- case it falls back to opening the project so the click still does something.
 -- wait_seconds is Windows-only (see run_jsx_in_ae_windows); Mac polls and ignores it.
+-- A fresh path for a temp script ending in `suffix`. On Windows it goes in TEMP (or TMP):
+-- os.tmpname() there is MSVCRT tmpnam, a bare root-of-drive name such as "\\s1b4.", which an
+-- unelevated process often cannot create, and every Open AE Comp and push from Make AE Comp
+-- would then fall back to only opening the project (review 2026-11-05, not verified on Windows).
+-- Elsewhere, or with neither variable set, os.tmpname(): it creates the file it names, so the
+-- stem is removed straight away and only the suffixed name is used. `getenv` is for the unit
+-- test (unit/temp_script_path); callers leave it out.
+function temp_script_path(is_windows, suffix, getenv)
+    getenv = getenv or os.getenv
+    if is_windows then
+        local dir = getenv("TEMP") or getenv("TMP")
+        if dir and dir ~= "" then
+            dir = dir:gsub("[/\\]+$", "")
+            return dir .. "\\daelink_" .. os.time() .. "_" .. math.random(100000, 999999) .. suffix
+        end
+    end
+    local stem = os.tmpname()
+    os.remove(stem)
+    return stem .. suffix
+end
+
 function run_jsx_in_ae(ae_path, jsx_source, is_windows, wait_seconds)
-    local tmp_jsx = os.tmpname() .. ".jsx"
+    -- Deleted after the run
+    local tmp_jsx = temp_script_path(is_windows, ".jsx")
     local f = io.open(tmp_jsx, "w")
     if not f then
         print("DAELink: Could not create temp script, falling back to project open.")
         if is_windows then
             os.execute('cmd /c start "" "' .. ae_path:gsub("/", "\\") .. '"')
         else
-            os.execute('open "' .. ae_path .. '"')
+            os.execute('open ' .. shell_quote(ae_path))
         end
         return false
     end
@@ -4170,7 +4634,7 @@ function run_jsx_in_ae_mac(ae_path, tmp_jsx)
     -- 3. Only calls `open` on the .aep if needed, then polls until AE is responsive
     -- 4. Calls DoScriptFile to run the payload
     -- Uses bundle ID (com.adobe.AfterEffects.application) so it works across AE versions.
-    local tmp_scpt = os.tmpname() .. ".applescript"
+    local tmp_scpt = temp_script_path(false, ".applescript")
     local escaped_ae_path = ae_path:gsub('"', '\\"')
     local applescript = [[
 set jsxFile to "]] .. tmp_jsx .. [["
@@ -4255,15 +4719,15 @@ end realPath
     local f = io.open(tmp_scpt, "w")
     if not f then
         print("DAELink: Could not create temp AppleScript, falling back to project open.")
-        os.execute('rm -f "' .. tmp_jsx .. '"')
-        os.execute('open "' .. ae_path .. '"')
+        os.execute('rm -f ' .. shell_quote(tmp_jsx))
+        os.execute('open ' .. shell_quote(ae_path))
         return
     end
     f:write(applescript)
     f:close()
 
     -- Run in background so we don't block the Resolve UI
-    local cmd = '(osascript "' .. tmp_scpt .. '"; rm -f "' .. tmp_jsx .. '" "' .. tmp_scpt .. '") &'
+    local cmd = '(osascript ' .. shell_quote(tmp_scpt) .. '; rm -f ' .. shell_quote(tmp_jsx) .. ' ' .. shell_quote(tmp_scpt) .. ') &'
     os.execute(cmd)
 end
 
@@ -4491,7 +4955,7 @@ function handle_insert_placeholder(ev)
     update_project_fps()
     local success = insert_placeholder_timeline_at_playhead()
     if not success then
-        alert("Failed to insert placeholder.\nMake sure you have an active timeline open.")
+        alert("Failed to insert placeholder.\nMake sure you have an active timeline open and its top video track is not locked.")
     end
 end
 
@@ -4500,7 +4964,7 @@ function handle_nest_linked_in_ae_comp(ev)
     update_project_fps()
 
     -- Validate placeholder is under the playhead before showing the dialog
-    local placeholder_mpi = get_mpi_by_name(_G.CONSTANTS.PLACEHOLDER_TL_NAME)
+    local placeholder_mpi = get_mpi_by_name(_G.CONSTANTS.PLACEHOLDER_TL_NAME, nil, "Timeline")
     if not placeholder_mpi then
         alert("Error: DAELinkPlaceholder timeline not found in Media Pool.")
         return

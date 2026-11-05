@@ -240,6 +240,9 @@ function DAELink(thisObj) {
             // On mismatch/missing: null state and fall through to reconnect logic.
             if (jsonFile && jsonFile.exists) {
                 var data = loadJSONData();
+                // Unreadable: loadJSONData has said why. Carrying on reloaded it through the
+                // reconnect path and showed the same error twice per click.
+                if (!data) return false;
                 var linkedMatches = findFoldersByName(CONFIG.folderNames.linkedComps, null);
 
                 if (linkedMatches.length > 1) {
@@ -269,11 +272,11 @@ function DAELink(thisObj) {
                 var savedPath = loadProjectPath(projectID);
 
                 if (savedPath) {
-                    var testJson = new File(savedPath + "/" + CONFIG.directoryNames.root + "/" + CONFIG.directoryNames.support + "/" + CONFIG.fileNames.json);
+                    var testJson = pathFile(savedPath + "/" + CONFIG.directoryNames.root + "/" + CONFIG.directoryNames.support + "/" + CONFIG.fileNames.json);
                     if (testJson.exists) {
                         // Path still valid - connect silently
                         JSONfilePath = savedPath + "/" + CONFIG.directoryNames.root + "/" + CONFIG.directoryNames.support + "/" + CONFIG.fileNames.json;
-                        jsonFile = new File(JSONfilePath);
+                        jsonFile = pathFile(JSONfilePath);
                         if (!versionCheck()) { jsonFile = null; return false; }
                         if (findOrCreateDAELinkFolders()) {
                             projectMediaPath = savedPath;
@@ -305,14 +308,14 @@ function DAELink(thisObj) {
                 if (lastSlash !== -1) normalizedPath = normalizedPath.substring(0, lastSlash);
             }
 
-            var daelinkFolder = new Folder(normalizedPath + "/" + CONFIG.directoryNames.root);
+            var daelinkFolder = pathFolder(normalizedPath + "/" + CONFIG.directoryNames.root);
             if (!daelinkFolder.exists) {
                 alert("No daelink folder found at that location.");
                 return false;
             }
 
             JSONfilePath = normalizedPath + "/" + CONFIG.directoryNames.root + "/" + CONFIG.directoryNames.support + "/" + CONFIG.fileNames.json;
-            jsonFile = new File(JSONfilePath);
+            jsonFile = pathFile(JSONfilePath);
 
             if (!versionCheck()) { jsonFile = null; return false; }
 
@@ -514,7 +517,7 @@ function DAELink(thisObj) {
     // successful probe reuses the same name and cleans it up, which is why checkScriptFileAccess
     // keeps probing while in the failed state instead of caching the failure.
     function canWriteToFolder(folder) {
-        var probe = new File(folder.fsName + "/daelink_writetest.tmp");
+        var probe = pathFile(folder.fsName + "/daelink_writetest.tmp");
         var token = "daelink";
         var ok = false;
         try {
@@ -568,7 +571,7 @@ function DAELink(thisObj) {
 
     function backupHint() {
         if (!jsonFile) return "";
-        var backup = new File(jsonFile.fsName + ".bak");
+        var backup = pathFile(jsonFile.fsName + ".bak");
         if (!backup.exists) return "";
         return "\n\nA backup taken earlier this session is available at:\n" + backup.fsName;
     }
@@ -581,7 +584,7 @@ function DAELink(thisObj) {
         // Flag first: a failing backup must never be retried on every load
         jsonBackupDone[sourceFile.fsName] = true;
 
-        var backup = new File(sourceFile.fsName + ".bak");
+        var backup = pathFile(sourceFile.fsName + ".bak");
         try {
             try { backup.encoding = "UTF-8"; } catch (e) {}
             backup.lineFeed = ($.os && $.os.indexOf("Windows") !== -1) ? "Windows" : "Unix";
@@ -623,8 +626,11 @@ function DAELink(thisObj) {
     }
 
     // IMPORT HELPERS
+    // Returns the layers whose source file was not found, so the caller can keep them in the
+    // JSON for a later retry instead of losing them (review 2026-10-30, ae/22).
     function importAndAddLayers(comp, compData, fps) {
-        if (!compData.layers || compData.layers.length === 0) return;
+        var notFound = [];
+        if (!compData.layers || compData.layers.length === 0) return notFound;
         
         // Separate audio and video layers
         var audioLayers = [];
@@ -655,78 +661,150 @@ function DAELink(thisObj) {
         // Combine: video first (will appear at top in AE), then audio (will appear at bottom)
         var sortedLayers = videoLayers.concat(audioLayers);
 
+        // A layer that fails to import is kept in the JSON like a missing file, so the retry adds
+        // it and only it. A refusal used to drop it from the JSON for good, and a throw left the
+        // comp half built with every layer still listed, so the retry added them all again
+        // (review 2026-11-05, ae/27).
+        var missing = [];
+        var failed = [];
         for (var i = 0; i < sortedLayers.length; i++) {
             var layerData = sortedLayers[i];
-            var filePath = layerData.filePath;
-            var file = new File(filePath);
+            var currentLayer = null;
+            try {
+                var filePath = layerData.filePath;
+                var file = pathFile(filePath);
 
-            if (!file.exists) {
-                alert("File not found: " + filePath);
-                continue;
-            }
-
-            // Check if the footage is already imported to prevent re-importing
-            var importedItem = null;
-            for (var j = 1; j <= app.project.numItems; j++) {
-                var item = app.project.item(j);
-                if (item instanceof FootageItem && item.file && item.file.fsName === file.fsName) {
-                    importedItem = item;
-                    break;
-                }
-            }
-
-            if (!importedItem) {
-                var importOpts = new ImportOptions(file);
-                if (importOpts.canImportAs(ImportAsType.FOOTAGE)) {
-                    importOpts.importAs = ImportAsType.FOOTAGE;
-                    importedItem = app.project.importFile(importOpts);
-                    importedItem.parentFolder = importedMediaFolder; 
-                }
-                else {
-                    alert("Could not import file " + filePath + " as footage.");
+                if (!file.exists) {
+                    notFound.push(layerData);
+                    missing.push(layerData);
                     continue;
                 }
-            }
 
-            // Handle non-square pixel aspect ratio (legacy SD/anamorphic footage)
-            if (layerData.pixelAspect !== "N/A") {
-                if (layerData.pixelAspect !== 1) {
-                    if (confirm("Legacy pixel aspect ratio " + layerData.pixelAspect + " detected for layer '" + layerData.layerName + "'.\n\nChange to square?")) {
-                        importedItem.pixelAspect = 1;
-                    } else {
-                        alert("Pixel aspect ratio unchanged - sizing may appear incorrect.");
-                        importedItem.pixelAspect = layerData.pixelAspect;
+                // Check if the footage is already imported to prevent re-importing
+                var importedItem = null;
+                for (var j = 1; j <= app.project.numItems; j++) {
+                    var item = app.project.item(j);
+                    // A still import of a sequence's first image is not the sequence
+                    if (item instanceof FootageItem && item.file && item.file.fsName === file.fsName &&
+                        !(layerData.imageSequence && item.mainSource && item.mainSource.isStill)) {
+                        importedItem = item;
+                        break;
                     }
                 }
-                else {
-                    importedItem.pixelAspect = layerData.pixelAspect;
+
+                if (!importedItem) {
+                    var importOpts = new ImportOptions(file);
+                    if (importOpts.canImportAs(ImportAsType.FOOTAGE)) {
+                        importOpts.importAs = ImportAsType.FOOTAGE;
+                        // An image sequence arrives as its first image (Resolve reports it as
+                        // frame_[0001-0025].png, which is not a file). Imported as a sequence and
+                        // conformed to DaVinci's rate, since AE otherwise uses its own default
+                        // sequence rate (review 2026-10-30, ae/24).
+                        if (layerData.imageSequence) importOpts.sequence = true;
+                        importedItem = app.project.importFile(importOpts);
+                        var seqFPS = numberOr(layerData.sequenceFPS, 0);
+                        if (layerData.imageSequence && seqFPS > 0 && importedItem.mainSource) {
+                            importedItem.mainSource.conformFrameRate = seqFPS;
+                        }
+                        importedItem.parentFolder = importedMediaFolder; 
+                    }
+                    else {
+                        notFound.push(layerData);
+                        failed.push(filePath + " (After Effects cannot import it as footage)");
+                        continue;
+                    }
                 }
-            }
 
-            var currentLayer = comp.layers.add(importedItem);
+                // Handle non-square pixel aspect ratio (legacy SD/anamorphic footage). "N/A" marks an
+                // audio layer. A missing or unreadable value is square: asking about an "undefined"
+                // ratio and then assigning it threw (ae/18).
+                if (layerData.pixelAspect !== "N/A") {
+                    var par = numberOr(layerData.pixelAspect, 1);
+                    if (par <= 0) par = 1;
+                    if (Math.abs(par - 1) > 0.0001) {
+                        if (confirm("Legacy pixel aspect ratio " + par + " detected for layer '" + layerData.layerName + "'.\n\nChange to square?")) {
+                            importedItem.pixelAspect = 1;
+                        } else {
+                            alert("Pixel aspect ratio unchanged - sizing may appear incorrect.");
+                            importedItem.pixelAspect = par;
+                        }
+                    }
+                    else {
+                        importedItem.pixelAspect = 1;
+                    }
+                }
+
+                currentLayer = comp.layers.add(importedItem);
             
-            // Move audio layers to bottom (highest index)
-            if (layerData.mediaType === "audio") {
-                currentLayer.moveToEnd();
-            }
+                // Move audio layers to bottom (highest index). An audio layer can come from a video
+                // file (the editor kept a clip's sound and not its picture): its video switch is
+                // turned off, or that picture rendered at native size under every other layer
+                // (review 2026-10-30, ae/19).
+                if (layerData.mediaType === "audio") {
+                    currentLayer.moveToEnd();
+                    if (currentLayer.hasVideo) currentLayer.enabled = false;
+                } else if (layerData.withAudio === false && currentLayer.hasAudio) {
+                    // The picture's own sound was not linked in DaVinci (deleted, or moved and so
+                    // sent as a separate audio layer). Missing means older JSON: leave it playing.
+                    currentLayer.audioEnabled = false;
+                }
 
-            // Layer timing and trimming 
-            var layerStartTime = layerData.recordFrame / fps;
-            var sourceInPoint = layerData.sourceStartFrame / fps;
-            var clipDuration = layerData.duration / fps;
-            currentLayer.startTime = layerStartTime - sourceInPoint;
-            currentLayer.inPoint = layerStartTime;
-            currentLayer.outPoint = layerStartTime + clipDuration;
+                // Layer timing and trimming 
+                var layerStartTime = layerData.recordFrame / fps;
+                var sourceInPoint = layerData.sourceStartFrame / fps;
+                var clipDuration = layerData.duration / fps;
+                currentLayer.startTime = layerStartTime - sourceInPoint;
+                currentLayer.inPoint = layerStartTime;
+                currentLayer.outPoint = layerStartTime + clipDuration;
 
-            // Only set visual properties for video layers
-            if (layerData.mediaType !== "audio") {
-                applyDaVinciLook(currentLayer, layerData, importedItem, comp, compData, fps);
-                applyDaVinciBlendMode(currentLayer, layerData.compositeMode);
+                // Only set visual properties for video layers
+                if (layerData.mediaType !== "audio") {
+                    applyDaVinciLook(currentLayer, layerData, importedItem, comp, compData, fps);
+                    applyDaVinciBlendMode(currentLayer, layerData.compositeMode);
+                }
+            } catch (e) {
+                // A layer added before the throw would be added a second time by the retry
+                if (currentLayer) { try { currentLayer.remove(); } catch (e2) {} }
+                notFound.push(layerData);
+                failed.push((layerData.filePath || layerData.layerName) + " (" + String(e && e.message) + ")");
             }
         }
+        // One message for every layer left out, not a modal per layer
+        if (notFound.length > 0) {
+            var parts = [];
+            if (missing.length > 0) {
+                var names = [];
+                for (var n = 0; n < missing.length; n++) names.push(missing[n].filePath || ("(no file path) " + missing[n].layerName));
+                parts.push("These source files were not found, so '" + comp.name + "' was made without them:\n\n" +
+                      names.join("\n") +
+                      "\n\nReconnect the drive or restore the files, then click " + ICONS.downArrow +
+                      " Import Linked Comps to add the missing layers.");
+            }
+            if (failed.length > 0) {
+                parts.push("These layers could not be imported into '" + comp.name + "', so it was made without them:\n\n" +
+                      failed.join("\n") +
+                      "\n\nReplace or re-export those files, then click " + ICONS.downArrow +
+                      " Import Linked Comps to add them.");
+            }
+            alert(parts.join("\n\n"));
+        }
+        return notFound;
     }
 
     // A missing or unreadable value (JSON from before the field existed, "N/A") reads as fallback.
+    // File and Folder objects for a platform path. ExtendScript reads %xx in a path string as a
+    // URI escape, so a folder literally named "Job%20A" was looked up as "Job A" and reported
+    // missing (measured on AE 2025, review 2026-10-30, ae/23). Encoding first makes the string
+    // reach the disk as written. On Windows backslashes become forward slashes first, since
+    // File.encode would turn them into %5C; ExtendScript accepts C:/... on Windows.
+    function nativePathForEncode(p) {
+        p = String(p);
+        if ($.os && $.os.indexOf("Windows") !== -1) p = p.replace(/\\/g, "/");
+        return p;
+    }
+    function pathFile(p) { return new File(File.encode(nativePathForEncode(p))); }
+    function pathFolder(p) { return new Folder(Folder.encode(nativePathForEncode(p))); }
+
     function numberOr(value, fallback) {
         var n = Number(value);
         return (value === null || value === undefined || value === "" || isNaN(n)) ? fallback : n;
@@ -1010,7 +1088,10 @@ function DAELink(thisObj) {
 
     function findFoldersByName(name, parent) {
         var matches = [];
-        var items = parent ? parent.items : app.project.items;
+        // From the root folder, not app.project.items: that collection already lists every item
+        // at every depth, so recursing from it found a folder inside a subfolder twice and every
+        // button reported "Multiple folders named '0_LinkedComps'" (review 2026-10-30, ae/20).
+        var items = parent ? parent.items : app.project.rootFolder.items;
 
         for (var i = 1; i <= items.length; i++) {
             var item = items[i];
@@ -1053,10 +1134,20 @@ function DAELink(thisObj) {
             return;
         }
 
+        // Compare the files the names render to, not the names: 'Shot.1' and 'shot-1' both
+        // render to shot-1 on a case-insensitive disk and would overwrite each other. Same rule
+        // as render_name_key() on the DaVinci side, plus the characters only AE can put in a name.
+        var ownKey = renderNameKey(activeComp.name);
         for (var key in data.compositions) {
             var savedName = data.compositions[key].name;
+            if (savedName == null) continue;
             if (savedName === activeComp.name) {
                 alert("A composition named '" + activeComp.name + "' is already linked in this project. Please rename before linking.");
+                return;
+            }
+            if (renderNameKey(savedName) === ownKey) {
+                alert("'" + activeComp.name + "' would render to the same file as the linked comp '" + savedName +
+                      "'. Please rename it so it differs by more than case, dots or characters a file name cannot hold.");
                 return;
             }
         }
@@ -1139,7 +1230,7 @@ function DAELink(thisObj) {
     // click, or a comp already imported) must not pop a dialog the user did not ask for.
     function importNewComps(silent) {
         defineJSON();
-        jsonFile = new File(JSONfilePath);
+        jsonFile = pathFile(JSONfilePath);
         if (!jsonFile.exists) {
             alert("DAELink data file not found at " + jsonFile.fsName);
             return;
@@ -1158,6 +1249,7 @@ function DAELink(thisObj) {
         // group stays open and swallows every later unrelated edit into this same undo step.
         app.beginUndoGroup("Make Comps from JSON");
         var btnClickResult = false;
+        var missingKeys = [];
         try {
 
         for (var davinciCompID in data.compositions) {
@@ -1172,11 +1264,10 @@ function DAELink(thisObj) {
                     saveJSONData(data);
                     currentComp.openInViewer();
                     
-                    // Import and add layers 
-                    importAndAddLayers(currentComp, compData, fps);
-
-                    // Cleanup - remove layers from json once transferred 
-                    compData.layers = null; 
+                    // Import and add layers. Layers whose file was missing stay in the JSON so a
+                    // later Import Linked Comps can add them; the rest are cleared once transferred.
+                    var missingLayers = importAndAddLayers(currentComp, compData, fps);
+                    compData.layers = missingLayers.length > 0 ? missingLayers : null;
                     saveJSONData(data);
 
                     // Create markers from JSON data on the comp itself.
@@ -1199,15 +1290,47 @@ function DAELink(thisObj) {
                     btnClickResult = true; 
                 } 
             }
-            else {
-            // Comp has been created therefore has had an aeID already (so not null)
-            // Therefore if we don't find a matching ID in project, it must have been deleted
-                if (findCompByID(data.compositions[davinciCompID].aeID) == null) {
-                    var obsoleteCompName = data.compositions[davinciCompID].name; 
-                    delete data.compositions[davinciCompID];
-                    saveJSONData(data);
-                    btnClickResult = true;
+            else if (findCompByID(data.compositions[davinciCompID].aeID) == null) {
+                // Linked before, and its comp is not in this project. Collected rather than
+                // deleted here: see below.
+                missingKeys.push(davinciCompID);
+            }
+            else if (data.compositions[davinciCompID].layers && data.compositions[davinciCompID].layers.length > 0) {
+                // Imported before with some source files missing. Add the layers that can be
+                // found now; any still missing stay for the next try. They go on top of the
+                // layers already in the comp.
+                var retryData = data.compositions[davinciCompID];
+                var retryComp = findCompByID(retryData.aeID);
+                var before = retryData.layers.length;
+                var stillMissing = importAndAddLayers(retryComp, retryData, retryData.fps || 24);
+                retryData.layers = stillMissing.length > 0 ? stillMissing : null;
+                saveJSONData(data);
+                if (stillMissing.length < before) btnClickResult = true;
+            }
+        }
+
+        // A linked comp missing from the open project usually means it was deleted, but not
+        // always: a comp deleted by mistake (Ctrl+Z restores the comp, not the link), or a
+        // different .aep after a live-link takeover, where every ID differs. These entries
+        // used to be deleted with no message, during DaVinci's automatic push too, while the
+        // user was looking at DaVinci. Now the push never touches them, and the manual button
+        // names them and asks.
+        var askedAboutMissing = false;
+        if (missingKeys.length > 0 && !silent) {
+            var missingNames = [];
+            for (var mi = 0; mi < missingKeys.length; mi++) {
+                missingNames.push(data.compositions[missingKeys[mi]].name);
+            }
+            askedAboutMissing = true;
+            if (confirm("These linked comps are not in this After Effects project:\n\n" +
+                        missingNames.join("\n") +
+                        "\n\nUnlink them? Their DaVinci nests stay as they are, but Render, Queue and the marker buttons will no longer reach them.\n\n" +
+                        "Choose No if a comp was deleted by mistake: undo the delete, or open the project it lives in.")) {
+                for (var mk = 0; mk < missingKeys.length; mk++) {
+                    delete data.compositions[missingKeys[mk]];
                 }
+                saveJSONData(data);
+                btnClickResult = true;
             }
         }
 
@@ -1215,7 +1338,9 @@ function DAELink(thisObj) {
             // Runs on the normal path and on any throw, so the group is always balanced
             app.endUndoGroup();
         }
-        if (!btnClickResult && !silent) { alert("No new comps to link."); }
+        // Not after the question above: a "No" is an answer, and a second dialog on top of it
+        // would be noise.
+        if (!btnClickResult && !silent && !askedAboutMissing) { alert("No new comps to link."); }
         return btnClickResult;
     }
 
@@ -1248,8 +1373,12 @@ function DAELink(thisObj) {
         // No selection at all is treated the same as the "Select Render Template..." row.
         // loadTemplates() starts with removeAll(), which nulls selection, so if it ever throws
         // partway the dropdown is left empty - applyTemplate(null) would then throw here.
+        // The "No templates found" / "No output modules found" rows are messages, not templates,
+        // and applyTemplate threw on them after the comp was already queued.
+        var templateText = templateDropdown.selection ? String(templateDropdown.selection.text) : "";
         if (!templateDropdown.selection ||
-            templateDropdown.selection.index === 0) {
+            templateDropdown.selection.index === 0 ||
+            templateText === "No templates found" || templateText === "No output modules found") {
             alert("Please select a valid render template from the dropdown.");
             return;
         }
@@ -1277,7 +1406,7 @@ function DAELink(thisObj) {
         data.compositions[findCompKeyByAeID(data, activeComp.id)].duration = Math.round(activeComp.duration * activeComp.frameRate); // Update in case of changes
         saveJSONData(data);
         
-        outputModule.file = new File(renderPath);
+        outputModule.file = pathFile(renderPath);
 
         // AE decides the extension itself, and rewrites the path it was handed to do so. Read it
         // back and confirm our basename survived - if it did not, the render lands somewhere
@@ -1294,7 +1423,10 @@ function DAELink(thisObj) {
     function loadTemplates() {
         templateDropdown.removeAll();
         templateDropdown.add("item", "Select Render Template...");
-        var originalComp = activeComp;
+        // Read the active item now, not activeComp: that is captured when the panel is built
+        // and only refreshed by some handlers, so restoring it reopened whatever comp was
+        // active at load, and the first click then acted on that comp (ae/16).
+        var originalComp = app.project.activeItem;
 
         if (app.project.renderQueue.numItems > 0) {
             // Accessing existing templates from the first item in the render queue
@@ -1332,9 +1464,10 @@ function DAELink(thisObj) {
             tempComp.remove();
         }
 
-        // Restore the original composition to active if available
-        if (originalComp) {
-            originalComp.openInViewer();
+        // Restore the comp the user was on. A failed restore must not fail the click that
+        // loaded the templates (ae/17).
+        if (originalComp && originalComp instanceof CompItem) {
+            try { originalComp.openInViewer(); } catch (e) {}
         }
     }
 
@@ -1467,23 +1600,33 @@ function DAELink(thisObj) {
         var compData = data.compositions[findCompKeyByAeID(data, activeComp.id)];
         var markerProp = activeComp.markerProperty;
 
-        while (markerProp.numKeys > 0) {
-            markerProp.removeKey(1);
-        }
+        // Read before anything is removed: an entry with no markers key (recovered or
+        // hand-edited JSON) threw here after the comp's markers were already gone (ae/26).
+        // DaVinci's empty set replaces AE's, as importNewComps() reads it.
+        var markers = compData.markers || [];
 
-        var markers = compData.markers;
-        for (var i = 0; i < markers.length; i++) {
-            var m = markers[i];
-            var startTime = m.recordFrame / compData.fps;
-            // DaVinci has no 0-frame markers; its 1-frame markers map to AE's 0-duration ones.
-            var duration = m.duration <= 1 ? 0 : m.duration / compData.fps;
+        // One Ctrl+Z for the whole import, closed whatever happens (see importNewComps)
+        app.beginUndoGroup("DAELink Import Markers");
+        try {
+            while (markerProp.numKeys > 0) {
+                markerProp.removeKey(1);
+            }
 
-            // \n separates name and note in AE marker comments - \r is one-way only.
-            var myMarker = new MarkerValue(m.name + "\n" + m.note);
-            myMarker.duration = duration;
-            myMarker.label = m.color;
+            for (var i = 0; i < markers.length; i++) {
+                var m = markers[i];
+                var startTime = m.recordFrame / compData.fps;
+                // DaVinci has no 0-frame markers; its 1-frame markers map to AE's 0-duration ones.
+                var duration = m.duration <= 1 ? 0 : m.duration / compData.fps;
 
-            markerProp.setValueAtTime(startTime, myMarker);
+                // \n separates name and note in AE marker comments - \r is one-way only.
+                var myMarker = new MarkerValue(m.name + "\n" + m.note);
+                myMarker.duration = duration;
+                myMarker.label = m.color;
+
+                markerProp.setValueAtTime(startTime, myMarker);
+            }
+        } finally {
+            app.endUndoGroup();
         }
     }
 
@@ -1555,6 +1698,12 @@ function DAELink(thisObj) {
 
     function isReservedDeviceName(name) {
         return RESERVED_DEVICE_NAMES.indexOf("|" + String(name).toUpperCase() + "|") !== -1;
+    }
+
+    // The render file a comp name ends up as, lower case because the default Mac and Windows
+    // disks ignore case. Two names with the same key would render over each other.
+    function renderNameKey(name) {
+        return sanitizeFileName(name).toLowerCase();
     }
 
     function sanitizeFileName(name) {
@@ -1646,7 +1795,11 @@ function DAELink(thisObj) {
         // Write to a sibling .tmp, verify by re-parse, then swap over the original.
         // This survives mid-write failures (eg. AE script permissions disabled, which
         // previously caused open('w') to truncate the original then fail silently).
-        var tmpFile = new File(jsonFile.fsName + ".tmp");
+        // Named for this side; DaVinci writes daelink.json.lua.tmp. With one shared name a save
+        // in each app at the same moment could swap in the other's half-written file and then
+        // fail its own rename, leaving no daelink.json (review 2026-10-30).
+        var tmpFile = pathFile(jsonFile.fsName + ".ae.tmp");
+        if (tmpFile.exists) { try { tmpFile.remove(); } catch (e) {} }
         try { tmpFile.encoding = "UTF-8"; } catch (e) {}
         tmpFile.lineFeed = ($.os && $.os.indexOf("Windows") !== -1) ? "Windows" : "Unix";
 
@@ -1688,18 +1841,43 @@ function DAELink(thisObj) {
             return false;
         }
 
-        // Swap: remove original, rename tmp to original's name.
-        // File.rename takes only a leaf name and renames within the same folder.
+        // Swap: move the original aside, rename tmp to the original's name, then drop the
+        // original. Removing it first left the .ae.tmp as the only copy whenever the rename
+        // then failed (the Lua side reading the file at that moment, an AV scanner on Windows),
+        // and the Lua side never reads .ae.tmp. The Lua side moves its original to .old for the
+        // same reason (review 2026-11-05).
+        // File.rename takes only a leaf name and renames within the same folder, and changes the
+        // File object it is called on, so jsonFile itself is never renamed: fresh objects are.
         var leafName = decodeURI(jsonFile.name);
-        if (jsonFile.exists) {
-            if (!jsonFile.remove()) {
-                alert("Could not remove original JSON to swap in update (a stale .tmp may remain).");
+        var oldLeaf = leafName + ".ae.old";
+        var staleOld = pathFile(jsonFile.fsName + ".ae.old");
+        if (staleOld.exists) { try { staleOld.remove(); } catch (e) {} }
+        var movedAside = false;
+        var original = pathFile(jsonFile.fsName);
+        if (original.exists) {
+            if (!original.rename(oldLeaf)) {
+                try { tmpFile.remove(); } catch (e) {}
+                alert("Could not move the original JSON aside to swap in the update (original preserved).");
                 return false;
             }
+            movedAside = true;
         }
         if (!tmpFile.rename(leafName)) {
-            alert("Could not rename JSON temp file into place. The latest data is in: " + tmpFile.fsName);
+            var previous = "";
+            if (movedAside) {
+                // if/else, not a nested ternary: ExtendScript misparses those
+                if (pathFile(jsonFile.fsName + ".ae.old").rename(leafName)) {
+                    previous = "\nThe previous version was put back.";
+                } else {
+                    previous = "\nThe previous version is in: " + jsonFile.fsName + ".ae.old";
+                }
+            }
+            alert("Could not rename JSON temp file into place. The latest data is in: " + tmpFile.fsName + previous);
             return false;
+        }
+        if (movedAside) {
+            var aside = pathFile(jsonFile.fsName + ".ae.old");
+            try { aside.remove(); } catch (e) {}
         }
 
         return true;
