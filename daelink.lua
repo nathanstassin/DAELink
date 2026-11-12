@@ -62,6 +62,7 @@ _G.CONSTANTS = {
     DAELINK_VERSION = 0.9,
     SCHEMA_VERSION = 1,
     PLACEHOLDER_TL_NAME = "0_DAELinkPlaceholder",
+    KEYFRAME_TL_NAME = "0_DAELinkKeyframes",
     FOLDER_NAMES = {
         DAELINK = "0_DAELink",
         COMPOUNDCLIPS = "0_Compound Clips",
@@ -1265,9 +1266,10 @@ end
 -- Inspector keyframes. The scripting API cannot read them (GetProperty returns the static
 -- value at every playhead position, measured on 21.1.1), but Resolve's OTIO export carries
 -- every keyframed Inspector parameter, as { clip frame = value } counted from the clip's first
--- frame on the timeline. This exports the timeline, finds each clip by track and record start,
--- and returns, per clip, { field = { {frame, value}, ... } } in the units GetProperty uses.
--- Positions and crops are stored as fractions of the timeline frame, hence the scale.
+-- frame on the timeline. This exports the linked clips (see export_linked_clips), finds each
+-- clip by track and record start, and returns, per clip, { field = { {frame, value}, ... } } in
+-- the units GetProperty uses. Positions and crops are stored as fractions of the timeline frame,
+-- hence the scale.
 local KEYFRAME_PARAMS = {
     transformationZoomX = { "zoomX", 1 }, transformationZoomY = { "zoomY", 1 },
     transformationPan = { "pan", "w" }, transformationTilt = { "tilt", "h" },
@@ -1279,25 +1281,130 @@ local KEYFRAME_PARAMS = {
     distortionParam = { "distortion", 1 },
 }
 
-function read_clip_keyframes(timeline)
+-- The largest OTIO export read_clip_keyframes will load. Lua holds the text and the decoded
+-- table at once, so even this costs a few hundred MB. Exporting the whole edit produced 11 GB
+-- on a long edit (2026-11-11) and Make AE Comp died with "not enough memory".
+local KEYFRAME_EXPORT_MAX_BYTES = 32 * 1024 * 1024
+
+-- The scratch timeline the linked clips are rebuilt in, kept in the DAELink bin and emptied
+-- after every use. DAELink never deletes timelines (a delete in a cloud library is not one to
+-- risk), so it is created once and reused.
+function get_keyframe_timeline()
+    local mpi = get_mpi_by_name(_G.CONSTANTS.KEYFRAME_TL_NAME, _G.daelink_folder, "Timeline")
+    local tl = mpi and get_timeline_byID(mpi:GetMediaId())
+    if tl then return tl end
+    tl = create_empty_timeline(_G.CONSTANTS.KEYFRAME_TL_NAME)
+    if not tl then return nil end
+    local new_mpi = get_timeline_mpi(tl)
+    if new_mpi then _G.media_pool:MoveClips({ new_mpi }, _G.daelink_folder) end
+    return tl
+end
+
+function clear_timeline(tl)
+    local items = {}
+    for _, kind in ipairs({ "video", "audio" }) do
+        for i = 1, (tl:GetTrackCount(kind) or 0) do
+            for _, item in ipairs(tl:GetItemListInTrack(kind, i) or {}) do table.insert(items, item) end
+        end
+    end
+    if #items > 0 then tl:DeleteClips(items, false) end
+end
+
+-- Rebuilds the linked video clips alone in the scratch timeline, on the same tracks at the same
+-- offsets from the timeline start, with the same source ranges, and pastes each original's
+-- Inspector values and keyframes onto its copy with CopyAttributes (Resolve 21.1+). The OTIO
+-- export then holds only those clips, so its size follows what is linked to the placeholder and
+-- not the length of the edit. OTIO export ignores In/Out marks, so marking the placeholder's
+-- range on the edit does not help (both measured on 21.1.2, 2026-11-11: the pasted copy exports
+-- the same keys at the same clip frames as the original, and a marked export is byte for byte
+-- the whole one). Distortion is not among CopyAttributes' options, so keyed distortion arrives
+-- static. Exports it to `path` and empties it again, all while it is current: DeleteClips does
+-- nothing on a timeline that is not (measured 2026-11-11). Returns whether the export was
+-- written; the base timeline is current again either way.
+function export_linked_clips(base_timeline, clips, path)
+    local tl = get_keyframe_timeline()
+    if not tl then return nil end
+    _G.project:SetCurrentTimeline(tl)
+    local ok, err = pcall(function()
+        clear_timeline(tl)
+        local w = base_timeline:GetSetting("timelineResolutionWidth")
+        local h = base_timeline:GetSetting("timelineResolutionHeight")
+        if tostring(tl:GetSetting("timelineResolutionWidth")) ~= tostring(w) or
+           tostring(tl:GetSetting("timelineResolutionHeight")) ~= tostring(h) then
+            set_timeline_resolution(tl, w, h)
+        end
+        local options = {
+            keyframeTiming = _G.resolve.KEYFRAME_TIMING_MAINTAIN,
+            position = true, rotationAngle = true, anchorPoint = true, pitch = true, yaw = true,
+            allZoomAttributes = true, allCropAttributes = true, allFlipAttributes = true,
+            opacity = true, compositionMode = true,
+        }
+        for _, clip in ipairs(clips) do
+            local track = clip:GetTrackTypeAndIndex()[2]
+            while tl:GetTrackCount("video") < track do tl:AddTrack("video") end
+            local info = {
+                mediaPoolItem = clip:GetMediaPoolItem(), trackIndex = track, mediaType = 1,
+                recordFrame = tl:GetStartFrame() + (clip:GetStart() - base_timeline:GetStartFrame()),
+            }
+            -- A still's source range is 0 to 0, which appends nothing (see the lone-still branch
+            -- of replace_linked_with_aecomp); without a range it lands at its default length.
+            if not is_still_clip(clip) then
+                info.startFrame = clip:GetSourceStartFrame()
+                info.endFrame = clip:GetSourceEndFrame()
+            end
+            local added = _G.media_pool:AppendToTimeline({ info })
+            local copy = added and added[1]
+            if not (copy and clip:CopyAttributes({ copy }, options)) then
+                print("DAELink: Could not copy '" .. tostring(clip:GetName()) .. "' to read its keyframes; static values for it.")
+            end
+        end
+        return tl:Export(path, _G.resolve.EXPORT_OTIO, _G.resolve.EXPORT_NONE)
+    end)
+    pcall(clear_timeline, tl)
+    _G.project:SetCurrentTimeline(base_timeline)
+    if not ok then
+        print("DAELink: Could not rebuild the linked clips to read keyframes: " .. tostring(err))
+        return false
+    end
+    return err and true or false
+end
+
+-- `clips` are the linked video clips. Before Resolve 21.1 there is no CopyAttributes, so the
+-- whole edit is exported as before, behind the same size limit.
+function read_clip_keyframes(base_timeline, clips)
     local found = {}
-    if not (_G.resolve.EXPORT_OTIO and _G.project_media_path) then return found end
+    if not (_G.resolve.EXPORT_OTIO and _G.project_media_path) or #clips == 0 then return found end
     local path = build_project_paths(_G.project_media_path).support .. "/daelink_keyframes.otio"
-    local ok = pcall(function() return timeline:Export(path, _G.resolve.EXPORT_OTIO, _G.resolve.EXPORT_NONE) end)
+    os.remove(path)
+    local ok
+    if clips[1].CopyAttributes then
+        ok = export_linked_clips(base_timeline, clips, path)
+    else
+        ok = pcall(function() return base_timeline:Export(path, _G.resolve.EXPORT_OTIO, _G.resolve.EXPORT_NONE) end)
+    end
     local f = ok and io.open(path, "r")
     if not f then
         print("DAELink: Could not export the timeline to read keyframes; static values only.")
+        os.remove(path)
         return found
     end
+    local size = f:seek("end") or 0
+    if size > KEYFRAME_EXPORT_MAX_BYTES then
+        f:close(); os.remove(path)
+        print(string.format("DAELink: The keyframe export is %.0f MB, too large to read; static values only.", size / 1048576))
+        return found
+    end
+    f:seek("set")
     local text = f:read("*a"); f:close(); os.remove(path)
     local decoded, otio = pcall(json.decode, text)
+    text = nil
     if not decoded or type(otio) ~= "table" then
         print("DAELink: Could not read the timeline's keyframes; static values only.")
         return found
     end
 
-    local w = tonumber(timeline:GetSetting("timelineResolutionWidth")) or 1920
-    local h = tonumber(timeline:GetSetting("timelineResolutionHeight")) or 1080
+    local w = tonumber(base_timeline:GetSetting("timelineResolutionWidth")) or 1920
+    local h = tonumber(base_timeline:GetSetting("timelineResolutionHeight")) or 1080
     local scale = { w = w, h = h }
     local function frames_of(range_part)
         return range_part and tonumber(range_part.value) or 0
@@ -1416,7 +1523,7 @@ function clip_input_scaling(clip, base_timeline)
     return mapped
 end
 
-function write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeholder, comp_name, resolutionHeight, resolutionWidth, fps, duration, base_timeline)
+function write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeholder, comp_name, resolutionHeight, resolutionWidth, fps, duration, base_timeline, all_keyframes)
     -- No "or {}" fallback here. Substituting an empty structure for an unreadable file
     -- would write this one comp over every existing link. load_json_data has already
     -- told the user why; abort so the file on disk is left exactly as it was.
@@ -1488,7 +1595,7 @@ function write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeh
         end
     end
 
-    local all_keyframes = read_clip_keyframes(base_timeline)
+    all_keyframes = all_keyframes or {}
 
     for _, clip in ipairs(final_linked) do
         -- Trimmed to the placeholder, which the user agreed to in replace_linked_with_aecomp.
@@ -3263,6 +3370,16 @@ function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_setti
         if not trim then return end
     end
 
+    -- Keyframes are read before the nest exists, so a failure here leaves nothing behind. Only
+    -- video layers carry them.
+    local keyframe_clips = {}
+    for _, clip in ipairs(linked_to_placeholder) do
+        if clip:GetTrackTypeAndIndex()[1] == "video" and clip:GetName() ~= _G.CONSTANTS.PLACEHOLDER_TL_NAME then
+            table.insert(keyframe_clips, clip)
+        end
+    end
+    local all_keyframes = read_clip_keyframes(base_timeline, keyframe_clips)
+
     -- Create nested timeline
     local nested_timeline = create_empty_timeline(comp_name)
     if not nested_timeline then
@@ -3306,7 +3423,7 @@ function replace_linked_with_aecomp(comp_name, use_custom_settings, custom_setti
     -- nested timeline"), so a refused save stops here, before anything in the edit changes, like
     -- every check above. The empty nest timeline already exists and is left for the user: DAELink
     -- does not delete timelines on its own (review 2026-11-05, resolve/57).
-    local saved, why = write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeholder, comp_name, resolutionHeight, resolutionWidth, fps, placeholder_duration, base_timeline)
+    local saved, why = write_compdata_tojson(nested_timeline_id, placeholder, linked_to_placeholder, comp_name, resolutionHeight, resolutionWidth, fps, placeholder_duration, base_timeline, all_keyframes)
     if not saved then
         _G.project:SetCurrentTimeline(base_timeline)
         print("DAELink: Make AE Comp stopped before changing the edit; the empty timeline '" .. comp_name .. "' was created and can be deleted.")
